@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime
 
 from aiogram import Router, F, Bot
 from aiogram.filters import CommandStart, Command
@@ -7,6 +8,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery
 
 import db
+import pricing
 from config import (
     ADMIN_TELEGRAM_ID, AGENT_LEADS_CHAT_ID, COMPANY_NAME, COMPANY_CONTACTS,
     PROPERTY_TYPES, PEAK_RULE_NOTE,
@@ -54,6 +56,11 @@ class AdminAddProperty(StatesGroup):
 
 class AdminEditField(StatesGroup):
     waiting_value = State()
+
+
+class PriceCalc(StatesGroup):
+    check_in = State()
+    check_out = State()
 
 
 WELCOME_TEXT = (
@@ -133,17 +140,8 @@ def _format_property_card(p: dict) -> str:
         lines.append("")
         lines.append(p["description"])
 
-    prices = p.get("prices") or []
-    if prices:
-        lines.append("")
-        lines.append(f"💰 <b>Цены по сезонам ({p.get('currency', 'THB')}, для агентов):</b>")
-        for period in prices:
-            lines.append(
-                f"• {period['period']}: {period['price_month_thb']:,} /мес "
-                f"({period['price_night_thb']:,} /ночь)".replace(",", " ")
-            )
-        lines.append("")
-        lines.append(PEAK_RULE_NOTE)
+    lines.append("")
+    lines.append("💰 Нажмите «Рассчитать цену на даты», чтобы узнать стоимость для конкретных дат.")
 
     links = p.get("links") or []
     if links:
@@ -168,6 +166,15 @@ async def cmd_start(message: Message, state: FSMContext):
         )
         return
     await message.answer(WELCOME_TEXT, reply_markup=kb.main_menu_kb(is_admin(message.from_user.id)))
+
+
+@router.message(Command("getid"))
+async def cmd_getid(message: Message):
+    await message.answer(
+        f"ID этого чата: <code>{message.chat.id}</code>\n\n"
+        "Скопируйте это значение в переменную AGENT_LEADS_CHAT_ID на Railway, "
+        "чтобы заявки от агентов приходили сюда."
+    )
 
 
 @router.message(AgentRegistration.name)
@@ -250,6 +257,97 @@ async def cb_property_card(call: CallbackQuery, state: FSMContext):
         text, reply_markup=kb.property_card_kb(prop_id), disable_web_page_preview=True
     )
     await call.answer()
+
+
+# ---------- Расчёт цены по датам ----------
+@router.callback_query(F.data.startswith("calc_price:"))
+async def cb_calc_price_start(call: CallbackQuery, state: FSMContext):
+    prop_id = call.data.split(":", 1)[1]
+    p = await db.get_property_by_id(prop_id)
+    if not p:
+        await call.answer("Объект не найден", show_alert=True)
+        return
+    await state.update_data(calc_property_id=prop_id)
+    await state.set_state(PriceCalc.check_in)
+    await call.message.edit_text(
+        f"📅 Расчёт цены для <b>{p['title']}</b>\n\n"
+        "Введите дату заезда в формате ДД.ММ.ГГГГ (например, 15.12.2026):",
+        reply_markup=kb.cancel_kb(),
+    )
+    await call.answer()
+
+
+@router.message(PriceCalc.check_in)
+async def calc_price_check_in(message: Message, state: FSMContext):
+    try:
+        check_in = datetime.strptime(message.text.strip(), "%d.%m.%Y").date()
+    except ValueError:
+        await message.answer(
+            "Не получилось распознать дату. Введите в формате ДД.ММ.ГГГГ (например, 15.12.2026):",
+            reply_markup=kb.cancel_kb(),
+        )
+        return
+    await state.update_data(check_in=check_in.isoformat())
+    await state.set_state(PriceCalc.check_out)
+    await message.answer(
+        "Теперь дату выезда в том же формате (ДД.ММ.ГГГГ):",
+        reply_markup=kb.cancel_kb(),
+    )
+
+
+@router.message(PriceCalc.check_out)
+async def calc_price_check_out(message: Message, state: FSMContext):
+    data = await state.get_data()
+    prop_id = data["calc_property_id"]
+    check_in = datetime.fromisoformat(data["check_in"]).date()
+
+    try:
+        check_out = datetime.strptime(message.text.strip(), "%d.%m.%Y").date()
+    except ValueError:
+        await message.answer(
+            "Не получилось распознать дату. Введите в формате ДД.ММ.ГГГГ (например, 25.12.2026):",
+            reply_markup=kb.cancel_kb(),
+        )
+        return
+
+    p = await db.get_property_by_id(prop_id)
+    if not p:
+        await state.clear()
+        await message.answer("Объект больше не найден.", reply_markup=kb.main_menu_kb(is_admin(message.from_user.id)))
+        return
+
+    try:
+        result = pricing.calculate_stay_price(check_in, check_out, p.get("prices") or [])
+    except pricing.DateRangeError as e:
+        await message.answer(
+            f"⚠️ {e}. Введите дату выезда ещё раз (ДД.ММ.ГГГГ):",
+            reply_markup=kb.cancel_kb(),
+        )
+        return
+
+    await state.update_data(check_out=check_out.isoformat())
+    await state.set_state(None)
+
+    lines = [
+        f"📅 <b>{p['title']}</b>",
+        f"Заезд: {check_in.strftime('%d.%m.%Y')} → Выезд: {check_out.strftime('%d.%m.%Y')}",
+        f"Ночей: {result['nights']}",
+        "",
+    ]
+    for item in result["breakdown"]:
+        if item["nights"] is None:
+            lines.append(f"• {item['period']}: {item['amount']:,} THB ({item['note']})".replace(",", " "))
+        else:
+            lines.append(
+                f"• {item['period']}: {item['nights']} ноч. × {item['rate']:,} = {item['amount']:,} THB".replace(",", " ")
+            )
+    lines.append("")
+    lines.append(f"💰 <b>Итого: {result['total_thb']:,} THB</b>".replace(",", " "))
+    if result["peak_rule_applied"]:
+        lines.append("")
+        lines.append(PEAK_RULE_NOTE)
+
+    await message.answer("\n".join(lines), reply_markup=kb.after_calc_kb(prop_id))
 
 
 # ---------- Контакты ----------
