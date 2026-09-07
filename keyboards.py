@@ -39,6 +39,7 @@ async def properties_list_kb(property_type: str) -> InlineKeyboardMarkup:
 
 def property_card_kb(property_id: str) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
+    b.button(text="📅 Рассчитать цену на даты", callback_data=f"calc_price:{property_id}")
     b.button(text="📝 Заявка по этому объекту", callback_data=f"lead_for:{property_id}")
     b.button(text="⬅️ К списку объектов", callback_data="back_to_list")
     b.button(text="🏠 В главное меню", callback_data="main_menu")
@@ -138,5 +139,14 @@ def admin_type_pick_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     for key, label in PROPERTY_TYPES.items():
         b.button(text=label, callback_data=f"admin_new_type:{key}")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def after_calc_kb(property_id: str) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="📝 Заявка на эти даты", callback_data=f"lead_for:{property_id}")
+    b.button(text="📅 Другие даты", callback_data=f"calc_price:{property_id}")
+    b.button(text="⬅️ К объекту", callback_data=f"prop:{property_id}")
     b.adjust(1)
     return b.as_markup()
