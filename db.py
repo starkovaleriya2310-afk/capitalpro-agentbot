@@ -66,9 +66,9 @@ async def upsert_property(p: dict):
             INSERT INTO properties (
                 id, type, title, district, bedrooms, sqm, view, pool_access,
                 address, map_link, max_guests, links, prices, currency,
-                description, photos, status, updated_at
+                description, photos, status, deposit, utilities_included, updated_at
             ) VALUES (
-                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17, now()
+                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19, now()
             )
             ON CONFLICT (id) DO UPDATE SET
                 type = EXCLUDED.type,
@@ -87,6 +87,8 @@ async def upsert_property(p: dict):
                 description = EXCLUDED.description,
                 photos = EXCLUDED.photos,
                 status = EXCLUDED.status,
+                deposit = EXCLUDED.deposit,
+                utilities_included = EXCLUDED.utilities_included,
                 updated_at = now()
             """,
             p["id"], p["type"], p["title"], p.get("district"), p.get("bedrooms"),
@@ -97,6 +99,7 @@ async def upsert_property(p: dict):
             p.get("currency", "THB"), p.get("description", ""),
             json.dumps(p.get("photos") or []),
             p.get("status", "available"),
+            p.get("deposit"), p.get("utilities_included"),
         )
 
 
@@ -104,6 +107,7 @@ async def update_property_field(property_id: str, field: str, value):
     allowed = {
         "type", "title", "district", "bedrooms", "sqm", "view", "pool_access",
         "address", "map_link", "max_guests", "currency", "description", "status",
+        "deposit", "utilities_included",
     }
     if field not in allowed:
         raise ValueError(f"Field '{field}' is not editable via update_property_field")
@@ -189,3 +193,161 @@ async def create_lead(
             dates, budget, comment, agent_id, telegram_user_id, telegram_username,
         )
         return dict(row)
+
+
+# ---------- Фильтрация для нового флоу (тип -> даты -> район -> список) ----------
+
+async def get_districts_by_type(prop_type: str) -> list[str]:
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT DISTINCT district FROM properties
+            WHERE type = $1 AND status = 'available' AND district IS NOT NULL
+            ORDER BY district
+            """,
+            prop_type,
+        )
+        return [r["district"] for r in rows]
+
+
+async def get_properties_by_type_district(prop_type: str, district: str) -> list[dict]:
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT * FROM properties
+            WHERE type = $1 AND district = $2 AND status = 'available'
+            ORDER BY title
+            """,
+            prop_type, district,
+        )
+        return [_row_to_property(r) for r in rows]
+
+
+# ---------- SETTINGS (редактируемые тексты бота) ----------
+
+async def get_setting(key: str, default: str = None) -> str:
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM settings WHERE key = $1", key)
+        return row["value"] if row else default
+
+
+async def set_setting(key: str, value: str):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, now())
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+            """,
+            key, value,
+        )
+
+
+# ---------- Расширенное редактирование объектов (JSONB поля) ----------
+
+async def update_property_prices(property_id: str, prices: list[dict]):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE properties SET prices = $1, updated_at = now() WHERE id = $2",
+            json.dumps(prices), property_id,
+        )
+
+
+async def update_property_links(property_id: str, links: list[str]):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE properties SET links = $1, updated_at = now() WHERE id = $2",
+            json.dumps(links), property_id,
+        )
+
+
+async def append_property_photo(property_id: str, file_id: str) -> int:
+    """Возвращает новое количество фото."""
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE properties
+            SET photos = photos || $1::jsonb, updated_at = now()
+            WHERE id = $2
+            RETURNING jsonb_array_length(photos) AS cnt
+            """,
+            json.dumps([file_id]), property_id,
+        )
+        return row["cnt"] if row else 0
+
+
+async def clear_property_photos(property_id: str):
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE properties SET photos = '[]'::jsonb, updated_at = now() WHERE id = $1",
+            property_id,
+        )
+
+
+# ---------- AGENTS: доп. функции ----------
+
+async def get_agent_by_id(agent_id: int):
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM agents WHERE id = $1", agent_id)
+        return dict(row) if row else None
+
+
+async def delete_agent(agent_id: int):
+    async with _pool.acquire() as conn:
+        await conn.execute("DELETE FROM agents WHERE id = $1", agent_id)
+
+
+async def get_all_agent_telegram_ids() -> list[int]:
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("SELECT telegram_id FROM agents")
+        return [r["telegram_id"] for r in rows]
+
+
+# ---------- LEADS: просмотр ----------
+
+async def get_recent_leads(limit: int = 15) -> list[dict]:
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT l.*, a.name AS agent_name, a.agency AS agent_agency
+            FROM leads l
+            LEFT JOIN agents a ON a.id = l.agent_id
+            ORDER BY l.created_at DESC
+            LIMIT $1
+            """,
+            limit,
+        )
+        return [dict(r) for r in rows]
+
+
+# ---------- СТАТИСТИКА ----------
+
+async def get_stats() -> dict:
+    async with _pool.acquire() as conn:
+        total_props = await conn.fetchval("SELECT COUNT(*) FROM properties")
+        by_type = await conn.fetch(
+            "SELECT type, COUNT(*) AS cnt FROM properties GROUP BY type ORDER BY cnt DESC"
+        )
+        by_status = await conn.fetch(
+            "SELECT status, COUNT(*) AS cnt FROM properties GROUP BY status"
+        )
+        total_agents = await conn.fetchval("SELECT COUNT(*) FROM agents")
+        total_leads = await conn.fetchval("SELECT COUNT(*) FROM leads")
+        leads_today = await conn.fetchval(
+            "SELECT COUNT(*) FROM leads WHERE created_at::date = CURRENT_DATE"
+        )
+        leads_week = await conn.fetchval(
+            "SELECT COUNT(*) FROM leads WHERE created_at >= now() - interval '7 days'"
+        )
+        leads_by_source = await conn.fetch(
+            "SELECT source, COUNT(*) AS cnt FROM leads GROUP BY source"
+        )
+        return {
+            "total_properties": total_props,
+            "by_type": {r["type"]: r["cnt"] for r in by_type},
+            "by_status": {r["status"]: r["cnt"] for r in by_status},
+            "total_agents": total_agents,
+            "total_leads": total_leads,
+            "leads_today": leads_today,
+            "leads_week": leads_week,
+            "leads_by_source": {r["source"]: r["cnt"] for r in leads_by_source},
+        }
