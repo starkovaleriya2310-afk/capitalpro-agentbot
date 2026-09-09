@@ -51,3 +51,14 @@ CREATE TABLE IF NOT EXISTS leads (
 CREATE INDEX IF NOT EXISTS idx_properties_type ON properties(type);
 CREATE INDEX IF NOT EXISTS idx_leads_agent ON leads(agent_id);
 CREATE INDEX IF NOT EXISTS idx_leads_source ON leads(source);
+
+-- Миграция: добавлены поля депозита и коммунальных услуг (для карточки объекта)
+ALTER TABLE properties ADD COLUMN IF NOT EXISTS deposit TEXT;
+ALTER TABLE properties ADD COLUMN IF NOT EXISTS utilities_included TEXT;
+
+-- Настройки бота, редактируемые через админ-панель (тексты, контакты)
+CREATE TABLE IF NOT EXISTS settings (
+    key         TEXT PRIMARY KEY,
+    value       TEXT,
+    updated_at  TIMESTAMPTZ DEFAULT now()
+);
