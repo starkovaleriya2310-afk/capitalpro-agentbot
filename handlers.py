@@ -5,7 +5,7 @@ from aiogram import Router, F, Bot
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, InputMediaPhoto
 
 import db
 import pricing
@@ -51,6 +51,8 @@ class AdminAddProperty(StatesGroup):
     map_link = State()
     max_guests = State()
     description = State()
+    deposit = State()
+    utilities = State()
     prices_text = State()
 
 
@@ -63,11 +65,59 @@ class PriceCalc(StatesGroup):
     check_out = State()
 
 
+class CatalogFlow(StatesGroup):
+    check_in = State()
+    check_out = State()
+
+
+class AdminEditPrices(StatesGroup):
+    waiting_text = State()
+
+
+class AdminEditLinks(StatesGroup):
+    waiting_text = State()
+
+
+class AdminPhotoUpload(StatesGroup):
+    uploading = State()
+
+
+class AdminSettingEdit(StatesGroup):
+    waiting_value = State()
+
+
+class AdminBroadcast(StatesGroup):
+    waiting_message = State()
+    confirming = State()
+
+
 WELCOME_TEXT = (
-    f"👋 Добро пожаловать в агентский бот <b>{COMPANY_NAME}</b>!\n\n"
-    "Здесь актуальные цены на объекты (уже с учётом комиссии) и быстрая "
-    "отправка заявок по вашим клиентам."
+    f"🌴 Привет! Это <b>{COMPANY_NAME}</b>\n\n"
+    "Помогаем агентам быстро находить и бронировать виллы и апартаменты для "
+    "клиентов — с актуальными ценами и без лишней переписки.\n\n"
+    "Готовы подобрать объект? Выберите, что интересует:"
 )
+
+
+async def get_welcome_text() -> str:
+    return await db.get_setting("welcome_text", WELCOME_TEXT)
+
+
+async def get_company_name() -> str:
+    return await db.get_setting("company_name", COMPANY_NAME)
+
+
+async def get_contact(key: str, default: str) -> str:
+    return await db.get_setting(f"contact_{key}", default)
+
+
+SETTINGS_LABELS = {
+    "welcome_text": "Приветственное сообщение",
+    "company_name": "Название компании",
+    "contact_telegram": "Telegram менеджера",
+    "contact_phone": "Телефон",
+    "contact_email": "Email",
+}
 
 PRICES_FORMAT_HINT = (
     "Введите цены по 11 периодам, каждая строка в формате:\n"
@@ -111,7 +161,7 @@ def _parse_prices_text(text: str) -> list[dict]:
     return result
 
 
-def _format_property_card(p: dict) -> str:
+def _format_property_card(p: dict, show_price_hint: bool = True) -> str:
     bedrooms = p.get("bedrooms")
     bedrooms_text = "студия" if bedrooms == 0 else (str(bedrooms) if bedrooms is not None else "—")
     status_map = {"available": "✅ Доступен", "booked": "🔴 Забронирован"}
@@ -140,8 +190,15 @@ def _format_property_card(p: dict) -> str:
         lines.append("")
         lines.append(p["description"])
 
+    if p.get("deposit"):
+        lines.append("")
+        lines.append(f"💳 Депозит: {p['deposit']}")
+    if p.get("utilities_included"):
+        lines.append(f"🔌 Коммунальные услуги: {p['utilities_included']}")
+
     lines.append("")
-    lines.append("💰 Нажмите «Рассчитать цену на даты», чтобы узнать стоимость для конкретных дат.")
+    if show_price_hint:
+        lines.append("💰 Нажмите «Рассчитать цену на даты», чтобы узнать стоимость для конкретных дат.")
 
     links = p.get("links") or []
     if links:
@@ -165,7 +222,8 @@ async def cmd_start(message: Message, state: FSMContext):
             "Как вас зовут?"
         )
         return
-    await message.answer(WELCOME_TEXT, reply_markup=kb.main_menu_kb(is_admin(message.from_user.id)))
+    text = await get_welcome_text()
+    await message.answer(text, reply_markup=kb.main_menu_kb(is_admin(message.from_user.id)))
 
 
 @router.message(Command("getid"))
@@ -211,13 +269,15 @@ async def reg_contact(message: Message, state: FSMContext):
 @router.callback_query(F.data == "main_menu")
 async def cb_main_menu(call: CallbackQuery, state: FSMContext):
     await state.clear()
-    await call.message.edit_text(WELCOME_TEXT, reply_markup=kb.main_menu_kb(is_admin(call.from_user.id)))
+    text = await get_welcome_text()
+    await call.message.edit_text(text, reply_markup=kb.main_menu_kb(is_admin(call.from_user.id)))
     await call.answer()
 
 
-# ---------- Каталог ----------
+# ---------- Каталог: тип -> даты -> район -> список ----------
 @router.callback_query(F.data == "catalog")
-async def cb_catalog(call: CallbackQuery):
+async def cb_catalog(call: CallbackQuery, state: FSMContext):
+    await state.update_data(catalog_type=None, catalog_check_in=None, catalog_check_out=None, catalog_district=None)
     await call.message.edit_text("🏡 Выберите тип объекта:", reply_markup=kb.catalog_types_kb())
     await call.answer()
 
@@ -225,20 +285,112 @@ async def cb_catalog(call: CallbackQuery):
 @router.callback_query(F.data.startswith("type:"))
 async def cb_type(call: CallbackQuery, state: FSMContext):
     prop_type = call.data.split(":", 1)[1]
-    await state.update_data(last_type=prop_type)
+    await state.update_data(catalog_type=prop_type)
+    await state.set_state(CatalogFlow.check_in)
     label = PROPERTY_TYPES.get(prop_type, prop_type)
-    markup = await kb.properties_list_kb(prop_type)
-    await call.message.edit_text(f"{label}\n\nВыберите объект:", reply_markup=markup)
+    await call.message.edit_text(
+        f"{label}\n\nВведите дату заезда (ДД.ММ.ГГГГ), чтобы подобрать варианты и сразу увидеть цену:",
+        reply_markup=kb.cancel_kb(),
+    )
     await call.answer()
 
 
-@router.callback_query(F.data == "back_to_list")
-async def cb_back_to_list(call: CallbackQuery, state: FSMContext):
+@router.message(CatalogFlow.check_in)
+async def catalog_check_in(message: Message, state: FSMContext):
+    try:
+        check_in = datetime.strptime(message.text.strip(), "%d.%m.%Y").date()
+    except ValueError:
+        await message.answer(
+            "Не получилось распознать дату. Введите в формате ДД.ММ.ГГГГ:",
+            reply_markup=kb.cancel_kb(),
+        )
+        return
+    await state.update_data(catalog_check_in=check_in.isoformat())
+    await state.set_state(CatalogFlow.check_out)
+    await message.answer("Дата выезда (ДД.ММ.ГГГГ):", reply_markup=kb.cancel_kb())
+
+
+@router.message(CatalogFlow.check_out)
+async def catalog_check_out(message: Message, state: FSMContext):
     data = await state.get_data()
-    prop_type = data.get("last_type", "villa")
+    try:
+        check_out = datetime.strptime(message.text.strip(), "%d.%m.%Y").date()
+        check_in = datetime.fromisoformat(data["catalog_check_in"]).date()
+    except ValueError:
+        await message.answer(
+            "Не получилось распознать дату. Введите в формате ДД.ММ.ГГГГ:",
+            reply_markup=kb.cancel_kb(),
+        )
+        return
+    if check_out <= check_in:
+        await message.answer(
+            "Дата выезда должна быть позже даты заезда. Введите ещё раз:",
+            reply_markup=kb.cancel_kb(),
+        )
+        return
+
+    await state.update_data(catalog_check_out=check_out.isoformat())
+    await state.set_state(None)
+
+    prop_type = data["catalog_type"]
+    districts = await db.get_districts_by_type(prop_type)
+    if not districts:
+        await message.answer(
+            "По этому типу объектов пока нет доступных вариантов.",
+            reply_markup=kb.main_menu_kb(is_admin(message.from_user.id)),
+        )
+        return
+
     label = PROPERTY_TYPES.get(prop_type, prop_type)
-    markup = await kb.properties_list_kb(prop_type)
-    await call.message.edit_text(f"{label}\n\nВыберите объект:", reply_markup=markup)
+    await message.answer(
+        f"{label}\n📅 {check_in.strftime('%d.%m.%Y')} → {check_out.strftime('%d.%m.%Y')}\n\n"
+        "Выберите район:",
+        reply_markup=kb.district_list_kb(districts),
+    )
+
+
+@router.callback_query(F.data.startswith("district:"))
+async def cb_district(call: CallbackQuery, state: FSMContext):
+    district = call.data.split(":", 1)[1]
+    data = await state.get_data()
+    prop_type = data.get("catalog_type")
+    await state.update_data(catalog_district=district)
+
+    items = await db.get_properties_by_type_district(prop_type, district)
+    if not items:
+        await call.answer("В этом районе пока нет доступных объектов", show_alert=True)
+        return
+
+    check_in = datetime.fromisoformat(data["catalog_check_in"]).date()
+    check_out = datetime.fromisoformat(data["catalog_check_out"]).date()
+
+    items_with_price = []
+    for p in items:
+        try:
+            result = pricing.calculate_stay_price(check_in, check_out, p.get("prices") or [])
+            total = result["total_thb"]
+        except pricing.DateRangeError:
+            total = None
+        items_with_price.append((p, total))
+
+    label = PROPERTY_TYPES.get(prop_type, prop_type)
+    await call.message.edit_text(
+        f"{label} • 📍 {district}\n📅 {check_in.strftime('%d.%m.%Y')} → {check_out.strftime('%d.%m.%Y')}\n\n"
+        "Выберите объект (цена указана за весь период):",
+        reply_markup=kb.properties_by_district_kb(items_with_price),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "back_to_districts")
+async def cb_back_to_districts(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    prop_type = data.get("catalog_type")
+    districts = await db.get_districts_by_type(prop_type)
+    label = PROPERTY_TYPES.get(prop_type, prop_type)
+    await call.message.edit_text(
+        f"{label}\n\nВыберите район:", reply_markup=kb.district_list_kb(districts)
+    )
     await call.answer()
 
 
@@ -250,9 +402,45 @@ async def cb_property_card(call: CallbackQuery, state: FSMContext):
         await call.answer("Объект не найден", show_alert=True)
         return
     await state.update_data(last_property_id=prop_id)
-    text = _format_property_card(p)
+
+    data = await state.get_data()
+    text = _format_property_card(p, show_price_hint=not (data.get("catalog_check_in") and data.get("catalog_check_out")))
+
+    ci_raw, co_raw = data.get("catalog_check_in"), data.get("catalog_check_out")
+    if ci_raw and co_raw:
+        check_in = datetime.fromisoformat(ci_raw).date()
+        check_out = datetime.fromisoformat(co_raw).date()
+        try:
+            result = pricing.calculate_stay_price(check_in, check_out, p.get("prices") or [])
+            price_lines = [
+                f"📅 {check_in.strftime('%d.%m.%Y')} → {check_out.strftime('%d.%m.%Y')} "
+                f"({result['nights']} ноч.)",
+            ]
+            for item in result["breakdown"]:
+                if item["nights"] is None:
+                    price_lines.append(f"• {item['period']}: {item['amount']:,} THB".replace(",", " "))
+                else:
+                    price_lines.append(
+                        f"• {item['period']}: {item['nights']} × {item['rate']:,} = {item['amount']:,} THB".replace(",", " ")
+                    )
+            price_lines.append(f"💰 <b>Итого: {result['total_thb']:,} THB</b>".replace(",", " "))
+            if result["peak_rule_applied"]:
+                price_lines.append(PEAK_RULE_NOTE)
+            text = "\n".join(price_lines) + "\n\n" + text
+        except pricing.DateRangeError:
+            pass
+
     if len(text) > 4000:
         text = text[:3990] + "\n\n…(сокращено)"
+
+    photos = p.get("photos") or []
+    if photos:
+        media = [InputMediaPhoto(media=file_id) for file_id in photos[:10]]
+        try:
+            await call.message.answer_media_group(media=media)
+        except Exception as e:
+            logger.error("Не удалось отправить фото объекта %s: %s", prop_id, e)
+
     await call.message.edit_text(
         text, reply_markup=kb.property_card_kb(prop_id), disable_web_page_preview=True
     )
@@ -353,11 +541,15 @@ async def calc_price_check_out(message: Message, state: FSMContext):
 # ---------- Контакты ----------
 @router.callback_query(F.data == "contacts")
 async def cb_contacts(call: CallbackQuery):
+    company_name = await get_company_name()
+    tg = await get_contact("telegram", COMPANY_CONTACTS["telegram_manager"])
+    phone = await get_contact("phone", COMPANY_CONTACTS["phone"])
+    email = await get_contact("email", COMPANY_CONTACTS["email"])
     text = (
-        f"📞 <b>Контакты {COMPANY_NAME}</b>\n\n"
-        f"Telegram: {COMPANY_CONTACTS['telegram_manager']}\n"
-        f"Телефон: {COMPANY_CONTACTS['phone']}\n"
-        f"Email: {COMPANY_CONTACTS['email']}\n"
+        f"📞 <b>Контакты {company_name}</b>\n\n"
+        f"Telegram: {tg}\n"
+        f"Телефон: {phone}\n"
+        f"Email: {email}\n"
     )
     await call.message.edit_text(text, reply_markup=kb.contacts_kb())
     await call.answer()
@@ -366,7 +558,7 @@ async def cb_contacts(call: CallbackQuery):
 # ---------- Заявка ----------
 @router.callback_query(F.data == "lead_start")
 async def cb_lead_start(call: CallbackQuery, state: FSMContext):
-    await state.update_data(property_id=None, property_title=None)
+    await state.update_data(property_id=None, property_title=None, dates_prefilled=False)
     await state.set_state(LeadForm.name)
     await call.message.edit_text("📝 Как зовут вашего клиента?", reply_markup=kb.cancel_kb())
     await call.answer()
@@ -378,6 +570,17 @@ async def cb_lead_for_property(call: CallbackQuery, state: FSMContext):
     p = await db.get_property_by_id(prop_id)
     title = p["title"] if p else prop_id
     await state.update_data(property_id=prop_id, property_title=title)
+
+    data = await state.get_data()
+    ci_raw, co_raw = data.get("catalog_check_in"), data.get("catalog_check_out")
+    if ci_raw and co_raw:
+        check_in = datetime.fromisoformat(ci_raw).date()
+        check_out = datetime.fromisoformat(co_raw).date()
+        dates_str = f"{check_in.strftime('%d.%m.%Y')} - {check_out.strftime('%d.%m.%Y')}"
+        await state.update_data(dates=dates_str, dates_prefilled=True)
+    else:
+        await state.update_data(dates_prefilled=False)
+
     await state.set_state(LeadForm.name)
     await call.message.edit_text(
         f"📝 Заявка по объекту: <b>{title}</b>\n\nКак зовут вашего клиента?",
@@ -405,6 +608,15 @@ async def lead_name(message: Message, state: FSMContext):
 @router.message(LeadForm.contact)
 async def lead_contact(message: Message, state: FSMContext):
     await state.update_data(contact=message.text)
+    data = await state.get_data()
+    if data.get("dates_prefilled"):
+        await state.set_state(LeadForm.budget)
+        await message.answer(
+            f"📅 Даты: {data.get('dates')} (взяты из подбора)\n\n"
+            "Бюджет клиента? (можно пропустить)",
+            reply_markup=kb.skip_kb(),
+        )
+        return
     await state.set_state(LeadForm.dates)
     await message.answer("На какие даты?", reply_markup=kb.cancel_kb())
 
@@ -484,8 +696,9 @@ async def lead_confirm(call: CallbackQuery, state: FSMContext, bot: Bot):
         telegram_username=user.username,
     )
 
+    company_name = await get_company_name()
     lead_text_lines = [
-        "🆕 <b>Новая заявка от агента — Capital Pro | Phuket</b>",
+        f"🆕 <b>Новая заявка от агента — {company_name}</b>",
         "",
         f"🧑‍💼 Агент: {agent_label}",
     ]
@@ -530,6 +743,27 @@ async def cb_admin_menu(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
+@router.callback_query(F.data == "admin_properties_menu")
+async def cb_admin_properties_menu(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("Доступ запрещён", show_alert=True)
+        return
+    await state.clear()
+    await call.message.edit_text("🏠 Объекты:", reply_markup=kb.admin_properties_menu_kb())
+    await call.answer()
+
+
+# ---- Агенты ----
+@router.callback_query(F.data == "admin_agents_menu")
+async def cb_admin_agents_menu(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("Доступ запрещён", show_alert=True)
+        return
+    await state.clear()
+    await call.message.edit_text("👥 Агенты:", reply_markup=kb.admin_agents_menu_kb())
+    await call.answer()
+
+
 @router.callback_query(F.data == "admin_agents")
 async def cb_admin_agents(call: CallbackQuery):
     if not is_admin(call.from_user.id):
@@ -546,11 +780,177 @@ async def cb_admin_agents(call: CallbackQuery):
                 f"контакт: {a.get('contact') or '—'}"
             )
         text = "\n".join(lines)
-    await call.message.edit_text(text, reply_markup=kb.admin_menu_kb())
+    await call.message.edit_text(text, reply_markup=kb.admin_agents_menu_kb())
     await call.answer()
 
 
-# ---- Удаление ----
+@router.callback_query(F.data == "admin_agents_delete")
+async def cb_admin_agents_delete(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Доступ запрещён", show_alert=True)
+        return
+    markup = await kb.admin_agents_pick_kb()
+    await call.message.edit_text("Выберите агента для удаления:", reply_markup=markup)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("admin_agent_del_pick:"))
+async def cb_admin_agent_del_pick(call: CallbackQuery):
+    agent_id = int(call.data.split(":", 1)[1])
+    agent = await db.get_agent_by_id(agent_id)
+    if not agent:
+        await call.answer("Агент не найден", show_alert=True)
+        return
+    await call.message.edit_text(
+        f"Удалить агента <b>{agent['name']} ({agent['agency']})</b>? "
+        "Он сможет заново зарегистрироваться через /start.",
+        reply_markup=kb.admin_agent_confirm_delete_kb(agent_id),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("admin_agent_del_confirm:"))
+async def cb_admin_agent_del_confirm(call: CallbackQuery):
+    agent_id = int(call.data.split(":", 1)[1])
+    await db.delete_agent(agent_id)
+    await call.message.edit_text("Агент удалён.", reply_markup=kb.admin_agents_menu_kb())
+    await call.answer("Удалено")
+
+
+# ---- Заявки ----
+@router.callback_query(F.data == "admin_leads")
+async def cb_admin_leads(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Доступ запрещён", show_alert=True)
+        return
+    leads = await db.get_recent_leads(15)
+    if not leads:
+        text = "Заявок пока не было."
+    else:
+        lines = ["📨 <b>Последние заявки</b>\n"]
+        for l in leads:
+            src = "агент" if l["source"] == "agent" else "гость"
+            agent_part = f" • {l['agent_name']} ({l['agent_agency']})" if l.get("agent_name") else ""
+            when = l["created_at"].strftime("%d.%m %H:%M") if l.get("created_at") else ""
+            lines.append(
+                f"• {when} [{src}]{agent_part}\n"
+                f"  {l.get('property_title') or '—'} · {l.get('client_name')} · {l.get('dates')}"
+            )
+        text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3990] + "\n\n…(сокращено)"
+    await call.message.edit_text(text, reply_markup=kb.back_to_admin_kb())
+    await call.answer()
+
+
+# ---- Статистика ----
+@router.callback_query(F.data == "admin_stats")
+async def cb_admin_stats(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Доступ запрещён", show_alert=True)
+        return
+    s = await db.get_stats()
+    by_type_lines = "\n".join(f"  • {t}: {c}" for t, c in s["by_type"].items())
+    by_status_lines = "\n".join(f"  • {st}: {c}" for st, c in s["by_status"].items())
+    by_source_lines = "\n".join(f"  • {src}: {c}" for src, c in s["leads_by_source"].items()) or "  —"
+    text = (
+        "📊 <b>Статистика</b>\n\n"
+        f"🏠 Объектов всего: {s['total_properties']}\n{by_type_lines}\n\n"
+        f"Статусы:\n{by_status_lines}\n\n"
+        f"👥 Агентов: {s['total_agents']}\n\n"
+        f"📨 Заявок всего: {s['total_leads']}\n"
+        f"  • сегодня: {s['leads_today']}\n"
+        f"  • за 7 дней: {s['leads_week']}\n"
+        f"  По источнику:\n{by_source_lines}"
+    )
+    await call.message.edit_text(text, reply_markup=kb.back_to_admin_kb())
+    await call.answer()
+
+
+# ---- Настройки бота ----
+@router.callback_query(F.data == "admin_settings_menu")
+async def cb_admin_settings_menu(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("Доступ запрещён", show_alert=True)
+        return
+    await state.clear()
+    await call.message.edit_text("⚙️ Настройки бота:", reply_markup=kb.admin_settings_menu_kb())
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("admin_setting_edit:"))
+async def cb_admin_setting_edit(call: CallbackQuery, state: FSMContext):
+    key = call.data.split(":", 1)[1]
+    defaults = {
+        "welcome_text": WELCOME_TEXT,
+        "company_name": COMPANY_NAME,
+        "contact_telegram": COMPANY_CONTACTS["telegram_manager"],
+        "contact_phone": COMPANY_CONTACTS["phone"],
+        "contact_email": COMPANY_CONTACTS["email"],
+    }
+    current = await db.get_setting(key, defaults.get(key, ""))
+    label = SETTINGS_LABELS.get(key, key)
+    await state.update_data(setting_key=key)
+    await state.set_state(AdminSettingEdit.waiting_value)
+    await call.message.edit_text(
+        f"✏️ <b>{label}</b>\n\nТекущее значение:\n{current}\n\nВведите новое значение:"
+    )
+    await call.answer()
+
+
+@router.message(AdminSettingEdit.waiting_value)
+async def admin_setting_apply(message: Message, state: FSMContext):
+    data = await state.get_data()
+    key = data["setting_key"]
+    await db.set_setting(key, message.text)
+    await state.clear()
+    label = SETTINGS_LABELS.get(key, key)
+    await message.answer(f"Готово, «{label}» обновлено.", reply_markup=kb.admin_settings_menu_kb())
+
+
+# ---- Рассылка агентам ----
+@router.callback_query(F.data == "admin_broadcast_start")
+async def cb_admin_broadcast_start(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("Доступ запрещён", show_alert=True)
+        return
+    await state.set_state(AdminBroadcast.waiting_message)
+    await call.message.edit_text("Введите текст сообщения для рассылки всем агентам:")
+    await call.answer()
+
+
+@router.message(AdminBroadcast.waiting_message)
+async def admin_broadcast_preview(message: Message, state: FSMContext):
+    await state.update_data(broadcast_text=message.text)
+    await state.set_state(AdminBroadcast.confirming)
+    await message.answer(
+        f"Предпросмотр:\n\n{message.text}\n\nОтправить всем агентам?",
+        reply_markup=kb.admin_broadcast_confirm_kb(),
+    )
+
+
+@router.callback_query(AdminBroadcast.confirming, F.data == "admin_broadcast_confirm")
+async def admin_broadcast_send(call: CallbackQuery, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    text = data.get("broadcast_text", "")
+    ids = await db.get_all_agent_telegram_ids()
+    sent, failed = 0, 0
+    for tg_id in ids:
+        try:
+            await bot.send_message(tg_id, f"📢 {text}")
+            sent += 1
+        except Exception as e:
+            logger.warning("Рассылка: не удалось отправить агенту %s: %s", tg_id, e)
+            failed += 1
+    await state.clear()
+    await call.message.edit_text(
+        f"Готово. Отправлено: {sent}, не удалось: {failed}.",
+        reply_markup=kb.admin_menu_kb(),
+    )
+    await call.answer()
+
+
+# ---- Удаление объекта ----
 @router.callback_query(F.data == "admin_delete")
 async def cb_admin_delete(call: CallbackQuery):
     if not is_admin(call.from_user.id):
@@ -575,7 +975,7 @@ async def cb_admin_delete_pick(call: CallbackQuery):
 async def cb_admin_delete_confirm(call: CallbackQuery):
     prop_id = call.data.split(":", 1)[1]
     await db.delete_property(prop_id)
-    await call.message.edit_text(f"Объект {prop_id} удалён.", reply_markup=kb.admin_menu_kb())
+    await call.message.edit_text(f"Объект {prop_id} удалён.", reply_markup=kb.admin_properties_menu_kb())
     await call.answer("Удалено")
 
 
@@ -604,7 +1004,7 @@ async def cb_admin_status_set(call: CallbackQuery):
     _, prop_id, new_status = call.data.split(":", 2)
     await db.update_property_field(prop_id, "status", new_status)
     await call.message.edit_text(
-        f"Статус {prop_id} обновлён: {new_status}", reply_markup=kb.admin_menu_kb()
+        f"Статус {prop_id} обновлён: {new_status}", reply_markup=kb.admin_properties_menu_kb()
     )
     await call.answer("Готово")
 
@@ -652,7 +1052,172 @@ async def admin_edit_apply(message: Message, state: FSMContext):
             return
     await db.update_property_field(prop_id, field, value)
     await state.clear()
-    await message.answer(f"Готово, {field} обновлено.", reply_markup=kb.admin_menu_kb())
+    await message.answer(f"Готово, {field} обновлено.", reply_markup=kb.admin_properties_menu_kb())
+
+
+# ---- Редактирование типа объекта ----
+@router.callback_query(F.data.startswith("admin_edit_type:"))
+async def cb_admin_edit_type(call: CallbackQuery):
+    prop_id = call.data.split(":", 1)[1]
+    await call.message.edit_text(
+        f"Новый тип для {prop_id}:", reply_markup=kb.admin_edit_type_pick_kb(prop_id)
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("admin_edit_type_set:"))
+async def cb_admin_edit_type_set(call: CallbackQuery):
+    _, prop_id, new_type = call.data.split(":", 2)
+    await db.update_property_field(prop_id, "type", new_type)
+    await call.message.edit_text(
+        f"Тип объекта {prop_id} обновлён.", reply_markup=kb.admin_properties_menu_kb()
+    )
+    await call.answer("Готово")
+
+
+# ---- Редактирование цен (все периоды разом) ----
+@router.callback_query(F.data.startswith("admin_edit_prices:"))
+async def cb_admin_edit_prices(call: CallbackQuery, state: FSMContext):
+    prop_id = call.data.split(":", 1)[1]
+    p = await db.get_property_by_id(prop_id)
+    current_lines = []
+    for period in (p.get("prices") or []):
+        current_lines.append(f"{period['period']}:{period['price_month_thb']}/{period['price_night_thb']}")
+    current_text = "\n".join(current_lines) if current_lines else "(цены не заданы)"
+    await state.update_data(edit_property_id=prop_id)
+    await state.set_state(AdminEditPrices.waiting_text)
+    await call.message.edit_text(
+        f"Текущие цены для {prop_id}:\n<code>{current_text}</code>\n\n"
+        f"Пришлите новый список полностью (заменит старый):\n\n{PRICES_FORMAT_HINT}"
+    )
+    await call.answer()
+
+
+@router.message(AdminEditPrices.waiting_text)
+async def admin_edit_prices_apply(message: Message, state: FSMContext):
+    prices = _parse_prices_text(message.text)
+    if not prices:
+        await message.answer(
+            "Не удалось распознать цены. Проверьте формат и отправьте ещё раз.\n\n"
+            + PRICES_FORMAT_HINT
+        )
+        return
+    data = await state.get_data()
+    prop_id = data["edit_property_id"]
+    await db.update_property_prices(prop_id, prices)
+    await state.clear()
+    await message.answer(
+        f"Готово, цены для {prop_id} обновлены ({len(prices)} периодов).",
+        reply_markup=kb.admin_properties_menu_kb(),
+    )
+
+
+# ---- Редактирование ссылок ----
+@router.callback_query(F.data.startswith("admin_edit_links:"))
+async def cb_admin_edit_links(call: CallbackQuery, state: FSMContext):
+    prop_id = call.data.split(":", 1)[1]
+    p = await db.get_property_by_id(prop_id)
+    current = "\n".join(p.get("links") or []) or "(ссылок нет)"
+    await state.update_data(edit_property_id=prop_id)
+    await state.set_state(AdminEditLinks.waiting_text)
+    await call.message.edit_text(
+        f"Текущие ссылки для {prop_id}:\n{current}\n\n"
+        "Пришлите новый список ссылок, каждая с новой строки (заменит старый). "
+        "Чтобы очистить - отправьте «-»."
+    )
+    await call.answer()
+
+
+@router.message(AdminEditLinks.waiting_text)
+async def admin_edit_links_apply(message: Message, state: FSMContext):
+    text = message.text.strip()
+    links = [] if text == "-" else [l.strip() for l in text.splitlines() if l.strip()]
+    data = await state.get_data()
+    prop_id = data["edit_property_id"]
+    await db.update_property_links(prop_id, links)
+    await state.clear()
+    await message.answer(
+        f"Готово, ссылки для {prop_id} обновлены ({len(links)} шт.).",
+        reply_markup=kb.admin_properties_menu_kb(),
+    )
+
+
+# ---- Фото объекта ----
+@router.callback_query(F.data == "admin_photos")
+async def cb_admin_photos(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Доступ запрещён", show_alert=True)
+        return
+    markup = await kb.admin_pick_property_kb("admin_photos_pick")
+    await call.message.edit_text("Выберите объект:", reply_markup=markup)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("admin_photos_pick:"))
+async def cb_admin_photos_pick(call: CallbackQuery):
+    prop_id = call.data.split(":", 1)[1]
+    p = await db.get_property_by_id(prop_id)
+    count = len(p.get("photos") or []) if p else 0
+    await call.message.edit_text(
+        f"🖼 Фото объекта {prop_id} (сейчас: {count} шт.):",
+        reply_markup=kb.admin_photos_menu_kb(prop_id),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("admin_photos_add:"))
+async def cb_admin_photos_add(call: CallbackQuery, state: FSMContext):
+    prop_id = call.data.split(":", 1)[1]
+    await state.update_data(photos_property_id=prop_id)
+    await state.set_state(AdminPhotoUpload.uploading)
+    await call.message.edit_text(
+        "Отправляйте фото по одному (можно несколько сообщений подряд). "
+        "Когда закончите — напишите «Готово»."
+    )
+    await call.answer()
+
+
+@router.message(AdminPhotoUpload.uploading, F.photo)
+async def admin_photo_received(message: Message, state: FSMContext):
+    data = await state.get_data()
+    prop_id = data["photos_property_id"]
+    file_id = message.photo[-1].file_id
+    count = await db.append_property_photo(prop_id, file_id)
+    await message.answer(f"📸 Добавлено. Всего фото у объекта: {count}. Ещё, или «Готово»?")
+
+
+@router.message(AdminPhotoUpload.uploading, F.text.lower().in_({"готово", "done", "/done"}))
+async def admin_photo_done(message: Message, state: FSMContext):
+    data = await state.get_data()
+    prop_id = data["photos_property_id"]
+    await state.clear()
+    await message.answer(
+        f"Готово, загрузка фото для {prop_id} завершена.",
+        reply_markup=kb.admin_properties_menu_kb(),
+    )
+
+
+@router.callback_query(F.data.startswith("admin_photos_view:"))
+async def cb_admin_photos_view(call: CallbackQuery):
+    prop_id = call.data.split(":", 1)[1]
+    p = await db.get_property_by_id(prop_id)
+    photos = (p.get("photos") or []) if p else []
+    if not photos:
+        await call.answer("У этого объекта пока нет фото", show_alert=True)
+        return
+    media = [InputMediaPhoto(media=file_id) for file_id in photos[:10]]
+    await call.message.answer_media_group(media=media)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("admin_photos_clear:"))
+async def cb_admin_photos_clear(call: CallbackQuery):
+    prop_id = call.data.split(":", 1)[1]
+    await db.clear_property_photos(prop_id)
+    await call.message.edit_text(
+        f"Все фото объекта {prop_id} удалены.", reply_markup=kb.admin_properties_menu_kb()
+    )
+    await call.answer("Удалено")
 
 
 # ---- Добавление нового объекта ----
@@ -763,6 +1328,25 @@ async def admin_add_maxguests(message: Message, state: FSMContext):
 async def admin_add_description(message: Message, state: FSMContext):
     desc = message.text.strip()
     await state.update_data(description="" if desc == "-" else desc)
+    await state.set_state(AdminAddProperty.deposit)
+    await message.answer("Депозит (например, «1 месяц аренды», или '-' если нет):")
+
+
+@router.message(AdminAddProperty.deposit)
+async def admin_add_deposit(message: Message, state: FSMContext):
+    deposit = message.text.strip()
+    await state.update_data(deposit=None if deposit == "-" else deposit)
+    await state.set_state(AdminAddProperty.utilities)
+    await message.answer(
+        "Коммунальные услуги - что входит, что оплачивается отдельно "
+        "(например, «Интернет и уборка включены, электричество отдельно», или '-'):"
+    )
+
+
+@router.message(AdminAddProperty.utilities)
+async def admin_add_utilities(message: Message, state: FSMContext):
+    utilities = message.text.strip()
+    await state.update_data(utilities_included=None if utilities == "-" else utilities)
     await state.set_state(AdminAddProperty.prices_text)
     await message.answer(PRICES_FORMAT_HINT)
 
@@ -793,6 +1377,8 @@ async def admin_add_prices(message: Message, state: FSMContext):
         "prices": prices,
         "currency": "THB",
         "description": data.get("description", ""),
+        "deposit": data.get("deposit"),
+        "utilities_included": data.get("utilities_included"),
         "photos": [],
         "status": "available",
     }
@@ -813,6 +1399,6 @@ async def admin_add_type_final(call: CallbackQuery, state: FSMContext):
     await db.upsert_property(prop)
     await state.clear()
     await call.message.edit_text(
-        f"✅ Объект {prop['id']} добавлен!", reply_markup=kb.admin_menu_kb()
+        f"✅ Объект {prop['id']} добавлен!", reply_markup=kb.admin_properties_menu_kb()
     )
     await call.answer("Сохранено")
