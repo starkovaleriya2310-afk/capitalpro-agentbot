@@ -1,4 +1,5 @@
 import logging
+import re
 from datetime import datetime
 
 from aiogram import Router, F, Bot
@@ -31,8 +32,6 @@ class AgentRegistration(StatesGroup):
 
 
 class LeadForm(StatesGroup):
-    name = State()
-    contact = State()
     dates = State()
     budget = State()
     comment = State()
@@ -61,13 +60,11 @@ class AdminEditField(StatesGroup):
 
 
 class PriceCalc(StatesGroup):
-    check_in = State()
-    check_out = State()
+    dates = State()
 
 
 class CatalogFlow(StatesGroup):
-    check_in = State()
-    check_out = State()
+    dates = State()
 
 
 class AdminEditPrices(StatesGroup):
@@ -135,6 +132,24 @@ PRICES_FORMAT_HINT = (
     "1–15 декабря:150000/5000\n"
     "15–31 декабря:210000/7000</code>"
 )
+
+
+DATES_FORMAT_HINT = (
+    "Введите даты заезда и выезда одним сообщением в формате "
+    "ДД.ММ.ГГГГ - ДД.ММ.ГГГГ, например:\n<code>13.12.2026 - 20.12.2026</code>"
+)
+
+
+def _parse_date_range(text: str):
+    """Извлекает две даты ДД.ММ.ГГГГ из свободного текста. Возвращает (check_in, check_out) как date."""
+    found = re.findall(r"\d{1,2}\.\d{1,2}\.\d{4}", text)
+    if len(found) != 2:
+        raise ValueError("Нужно ровно две даты в формате ДД.ММ.ГГГГ")
+    check_in = datetime.strptime(found[0], "%d.%m.%Y").date()
+    check_out = datetime.strptime(found[1], "%d.%m.%Y").date()
+    if check_out <= check_in:
+        raise ValueError("Дата выезда должна быть позже даты заезда")
+    return check_in, check_out
 
 
 def _parse_prices_text(text: str) -> list[dict]:
@@ -286,50 +301,27 @@ async def cb_catalog(call: CallbackQuery, state: FSMContext):
 async def cb_type(call: CallbackQuery, state: FSMContext):
     prop_type = call.data.split(":", 1)[1]
     await state.update_data(catalog_type=prop_type)
-    await state.set_state(CatalogFlow.check_in)
+    await state.set_state(CatalogFlow.dates)
     label = PROPERTY_TYPES.get(prop_type, prop_type)
     await call.message.edit_text(
-        f"{label}\n\nВведите дату заезда (ДД.ММ.ГГГГ), чтобы подобрать варианты и сразу увидеть цену:",
+        f"{label}\n\n{DATES_FORMAT_HINT}",
         reply_markup=kb.cancel_kb(),
     )
     await call.answer()
 
 
-@router.message(CatalogFlow.check_in)
-async def catalog_check_in(message: Message, state: FSMContext):
+@router.message(CatalogFlow.dates)
+async def catalog_dates(message: Message, state: FSMContext):
     try:
-        check_in = datetime.strptime(message.text.strip(), "%d.%m.%Y").date()
-    except ValueError:
-        await message.answer(
-            "Не получилось распознать дату. Введите в формате ДД.ММ.ГГГГ:",
-            reply_markup=kb.cancel_kb(),
-        )
+        check_in, check_out = _parse_date_range(message.text)
+    except ValueError as e:
+        await message.answer(f"⚠️ {e}.\n\n{DATES_FORMAT_HINT}", reply_markup=kb.cancel_kb())
         return
-    await state.update_data(catalog_check_in=check_in.isoformat())
-    await state.set_state(CatalogFlow.check_out)
-    await message.answer("Дата выезда (ДД.ММ.ГГГГ):", reply_markup=kb.cancel_kb())
 
-
-@router.message(CatalogFlow.check_out)
-async def catalog_check_out(message: Message, state: FSMContext):
     data = await state.get_data()
-    try:
-        check_out = datetime.strptime(message.text.strip(), "%d.%m.%Y").date()
-        check_in = datetime.fromisoformat(data["catalog_check_in"]).date()
-    except ValueError:
-        await message.answer(
-            "Не получилось распознать дату. Введите в формате ДД.ММ.ГГГГ:",
-            reply_markup=kb.cancel_kb(),
-        )
-        return
-    if check_out <= check_in:
-        await message.answer(
-            "Дата выезда должна быть позже даты заезда. Введите ещё раз:",
-            reply_markup=kb.cancel_kb(),
-        )
-        return
-
-    await state.update_data(catalog_check_out=check_out.isoformat())
+    await state.update_data(
+        catalog_check_in=check_in.isoformat(), catalog_check_out=check_out.isoformat()
+    )
     await state.set_state(None)
 
     prop_type = data["catalog_type"]
@@ -456,47 +448,24 @@ async def cb_calc_price_start(call: CallbackQuery, state: FSMContext):
         await call.answer("Объект не найден", show_alert=True)
         return
     await state.update_data(calc_property_id=prop_id)
-    await state.set_state(PriceCalc.check_in)
+    await state.set_state(PriceCalc.dates)
     await call.message.edit_text(
-        f"📅 Расчёт цены для <b>{p['title']}</b>\n\n"
-        "Введите дату заезда в формате ДД.ММ.ГГГГ (например, 15.12.2026):",
+        f"📅 Расчёт цены для <b>{p['title']}</b>\n\n{DATES_FORMAT_HINT}",
         reply_markup=kb.cancel_kb(),
     )
     await call.answer()
 
 
-@router.message(PriceCalc.check_in)
-async def calc_price_check_in(message: Message, state: FSMContext):
+@router.message(PriceCalc.dates)
+async def calc_price_dates(message: Message, state: FSMContext):
     try:
-        check_in = datetime.strptime(message.text.strip(), "%d.%m.%Y").date()
-    except ValueError:
-        await message.answer(
-            "Не получилось распознать дату. Введите в формате ДД.ММ.ГГГГ (например, 15.12.2026):",
-            reply_markup=kb.cancel_kb(),
-        )
+        check_in, check_out = _parse_date_range(message.text)
+    except ValueError as e:
+        await message.answer(f"⚠️ {e}.\n\n{DATES_FORMAT_HINT}", reply_markup=kb.cancel_kb())
         return
-    await state.update_data(check_in=check_in.isoformat())
-    await state.set_state(PriceCalc.check_out)
-    await message.answer(
-        "Теперь дату выезда в том же формате (ДД.ММ.ГГГГ):",
-        reply_markup=kb.cancel_kb(),
-    )
 
-
-@router.message(PriceCalc.check_out)
-async def calc_price_check_out(message: Message, state: FSMContext):
     data = await state.get_data()
     prop_id = data["calc_property_id"]
-    check_in = datetime.fromisoformat(data["check_in"]).date()
-
-    try:
-        check_out = datetime.strptime(message.text.strip(), "%d.%m.%Y").date()
-    except ValueError:
-        await message.answer(
-            "Не получилось распознать дату. Введите в формате ДД.ММ.ГГГГ (например, 25.12.2026):",
-            reply_markup=kb.cancel_kb(),
-        )
-        return
 
     p = await db.get_property_by_id(prop_id)
     if not p:
@@ -507,13 +476,9 @@ async def calc_price_check_out(message: Message, state: FSMContext):
     try:
         result = pricing.calculate_stay_price(check_in, check_out, p.get("prices") or [])
     except pricing.DateRangeError as e:
-        await message.answer(
-            f"⚠️ {e}. Введите дату выезда ещё раз (ДД.ММ.ГГГГ):",
-            reply_markup=kb.cancel_kb(),
-        )
+        await message.answer(f"⚠️ {e}.\n\n{DATES_FORMAT_HINT}", reply_markup=kb.cancel_kb())
         return
 
-    await state.update_data(check_out=check_out.isoformat())
     await state.set_state(None)
 
     lines = [
@@ -559,8 +524,8 @@ async def cb_contacts(call: CallbackQuery):
 @router.callback_query(F.data == "lead_start")
 async def cb_lead_start(call: CallbackQuery, state: FSMContext):
     await state.update_data(property_id=None, property_title=None, dates_prefilled=False)
-    await state.set_state(LeadForm.name)
-    await call.message.edit_text("📝 Как зовут вашего клиента?", reply_markup=kb.cancel_kb())
+    await state.set_state(LeadForm.dates)
+    await call.message.edit_text(f"📝 {DATES_FORMAT_HINT}", reply_markup=kb.cancel_kb())
     await call.answer()
 
 
@@ -578,12 +543,20 @@ async def cb_lead_for_property(call: CallbackQuery, state: FSMContext):
         check_out = datetime.fromisoformat(co_raw).date()
         dates_str = f"{check_in.strftime('%d.%m.%Y')} - {check_out.strftime('%d.%m.%Y')}"
         await state.update_data(dates=dates_str, dates_prefilled=True)
-    else:
-        await state.update_data(dates_prefilled=False)
+        await state.set_state(LeadForm.budget)
+        await call.message.edit_text(
+            f"📝 Заявка по объекту: <b>{title}</b>\n"
+            f"📅 Даты: {dates_str} (взяты из подбора)\n\n"
+            "Бюджет клиента? (можно пропустить)",
+            reply_markup=kb.skip_kb(),
+        )
+        await call.answer()
+        return
 
-    await state.set_state(LeadForm.name)
+    await state.update_data(dates_prefilled=False)
+    await state.set_state(LeadForm.dates)
     await call.message.edit_text(
-        f"📝 Заявка по объекту: <b>{title}</b>\n\nКак зовут вашего клиента?",
+        f"📝 Заявка по объекту: <b>{title}</b>\n\n{DATES_FORMAT_HINT}",
         reply_markup=kb.cancel_kb(),
     )
     await call.answer()
@@ -598,32 +571,15 @@ async def cb_lead_cancel(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-@router.message(LeadForm.name)
-async def lead_name(message: Message, state: FSMContext):
-    await state.update_data(name=message.text)
-    await state.set_state(LeadForm.contact)
-    await message.answer("Контакт клиента (телефон/WhatsApp/Telegram)?", reply_markup=kb.cancel_kb())
-
-
-@router.message(LeadForm.contact)
-async def lead_contact(message: Message, state: FSMContext):
-    await state.update_data(contact=message.text)
-    data = await state.get_data()
-    if data.get("dates_prefilled"):
-        await state.set_state(LeadForm.budget)
-        await message.answer(
-            f"📅 Даты: {data.get('dates')} (взяты из подбора)\n\n"
-            "Бюджет клиента? (можно пропустить)",
-            reply_markup=kb.skip_kb(),
-        )
-        return
-    await state.set_state(LeadForm.dates)
-    await message.answer("На какие даты?", reply_markup=kb.cancel_kb())
-
-
 @router.message(LeadForm.dates)
 async def lead_dates(message: Message, state: FSMContext):
-    await state.update_data(dates=message.text)
+    try:
+        check_in, check_out = _parse_date_range(message.text)
+    except ValueError as e:
+        await message.answer(f"⚠️ {e}.\n\n{DATES_FORMAT_HINT}", reply_markup=kb.cancel_kb())
+        return
+    dates_str = f"{check_in.strftime('%d.%m.%Y')} - {check_out.strftime('%d.%m.%Y')}"
+    await state.update_data(dates=dates_str)
     await state.set_state(LeadForm.budget)
     await message.answer("Бюджет клиента? (можно пропустить)", reply_markup=kb.skip_kb())
 
@@ -665,8 +621,6 @@ async def _show_summary(message: Message, state: FSMContext):
     lines = ["Проверьте заявку:\n"]
     if data.get("property_title"):
         lines.append(f"🏠 Объект: {data['property_title']}")
-    lines.append(f"👤 Клиент: {data.get('name')}")
-    lines.append(f"📞 Контакт: {data.get('contact')}")
     lines.append(f"📅 Даты: {data.get('dates')}")
     lines.append(f"💰 Бюджет: {data.get('budget')}")
     lines.append(f"💬 Комментарий: {data.get('comment')}")
@@ -680,14 +634,19 @@ async def lead_confirm(call: CallbackQuery, state: FSMContext, bot: Bot):
 
     agent = await db.get_agent_by_telegram_id(user.id)
     agent_id = agent["id"] if agent else None
-    agent_label = f"{agent['name']} ({agent['agency']})" if agent else "не зарегистрирован"
+    if agent:
+        agent_label = f"{agent['name']} ({agent['agency']})"
+        agent_contact = agent.get("contact") or "—"
+    else:
+        agent_label = "не зарегистрирован"
+        agent_contact = "—"
 
     await db.create_lead(
         source="agent",
         property_id=data.get("property_id"),
         property_title=data.get("property_title"),
-        client_name=data.get("name"),
-        client_contact=data.get("contact"),
+        client_name=None,
+        client_contact=None,
         dates=data.get("dates"),
         budget=data.get("budget"),
         comment=data.get("comment"),
@@ -701,12 +660,11 @@ async def lead_confirm(call: CallbackQuery, state: FSMContext, bot: Bot):
         f"🆕 <b>Новая заявка от агента — {company_name}</b>",
         "",
         f"🧑‍💼 Агент: {agent_label}",
+        f"📞 Контакт агента: {agent_contact}",
     ]
     if data.get("property_title"):
         lead_text_lines.append(f"🏠 Объект: {data['property_title']}")
     lead_text_lines += [
-        f"👤 Клиент: {data.get('name')}",
-        f"📞 Контакт клиента: {data.get('contact')}",
         f"📅 Даты: {data.get('dates')}",
         f"💰 Бюджет: {data.get('budget')}",
         f"💬 Комментарий: {data.get('comment')}",
