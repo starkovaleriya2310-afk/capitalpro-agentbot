@@ -37,11 +37,39 @@ async def properties_list_kb(property_type: str) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
+def district_list_kb(districts: list[str]) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for d in districts:
+        b.button(text=f"📍 {d}", callback_data=f"district:{d}")
+    b.button(text="⬅️ Изменить тип объекта", callback_data="catalog")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def properties_by_district_kb(items_with_price: list[tuple]) -> InlineKeyboardMarkup:
+    """items_with_price: список (property_dict, total_thb или None)"""
+    b = InlineKeyboardBuilder()
+    for p, total in items_with_price:
+        title = p["title"]
+        if total is not None:
+            price_part = f" — {total:,} THB".replace(",", " ")
+        else:
+            price_part = ""
+        label = f"{title}{price_part}"
+        if len(label) > 64:
+            max_title_len = 64 - len(price_part) - 1
+            label = f"{title[:max_title_len]}…{price_part}"
+        b.button(text=label, callback_data=f"prop:{p['id']}")
+    b.button(text="⬅️ К районам", callback_data="back_to_districts")
+    b.adjust(1)
+    return b.as_markup()
+
+
 def property_card_kb(property_id: str) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.button(text="📅 Рассчитать цену на даты", callback_data=f"calc_price:{property_id}")
+    b.button(text="📅 Рассчитать цену на другие даты", callback_data=f"calc_price:{property_id}")
     b.button(text="📝 Заявка по этому объекту", callback_data=f"lead_for:{property_id}")
-    b.button(text="⬅️ К списку объектов", callback_data="back_to_list")
+    b.button(text="⬅️ К списку объектов", callback_data="back_to_districts")
     b.button(text="🏠 В главное меню", callback_data="main_menu")
     b.adjust(1)
     return b.as_markup()
@@ -82,23 +110,36 @@ def confirm_lead_kb() -> InlineKeyboardMarkup:
 
 def admin_menu_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.button(text="➕ Добавить объект", callback_data="admin_add")
-    b.button(text="✏️ Редактировать объект", callback_data="admin_edit")
-    b.button(text="🔄 Статус объекта (быстро)", callback_data="admin_status")
-    b.button(text="🗑 Удалить объект", callback_data="admin_delete")
-    b.button(text="👥 Список агентов", callback_data="admin_agents")
+    b.button(text="🏠 Объекты", callback_data="admin_properties_menu")
+    b.button(text="👥 Агенты", callback_data="admin_agents_menu")
+    b.button(text="📨 Заявки", callback_data="admin_leads")
+    b.button(text="⚙️ Настройки бота", callback_data="admin_settings_menu")
+    b.button(text="📊 Статистика", callback_data="admin_stats")
+    b.button(text="📢 Рассылка агентам", callback_data="admin_broadcast_start")
     b.button(text="⬅️ В главное меню", callback_data="main_menu")
     b.adjust(1)
     return b.as_markup()
 
 
+def admin_properties_menu_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="➕ Добавить объект", callback_data="admin_add")
+    b.button(text="✏️ Редактировать объект", callback_data="admin_edit")
+    b.button(text="🖼 Фото объекта", callback_data="admin_photos")
+    b.button(text="🔄 Статус (доступен/забронирован)", callback_data="admin_status")
+    b.button(text="🗑 Удалить объект", callback_data="admin_delete")
+    b.button(text="⬅️ В админ-панель", callback_data="admin_menu")
+    b.adjust(1)
+    return b.as_markup()
+
+
 async def admin_pick_property_kb(prefix: str) -> InlineKeyboardMarkup:
-    """prefix: 'admin_edit_pick' / 'admin_status_pick' / 'admin_delete_pick'"""
+    """prefix: 'admin_edit_pick' / 'admin_status_pick' / 'admin_delete_pick' / 'admin_photos_pick'"""
     b = InlineKeyboardBuilder()
     items = await db.get_all_properties()
     for p in items:
         b.button(text=f"{p['id']} — {p['title']}", callback_data=f"{prefix}:{p['id']}")
-    b.button(text="⬅️ В админ-панель", callback_data="admin_menu")
+    b.button(text="⬅️ В админ-панель", callback_data="admin_properties_menu")
     b.adjust(1)
     return b.as_markup()
 
@@ -110,11 +151,89 @@ def admin_edit_fields_kb(property_id: str) -> InlineKeyboardMarkup:
         ("sqm", "Площадь"), ("view", "Вид"), ("pool_access", "Бассейн"),
         ("address", "Адрес"), ("map_link", "Ссылка на карту"),
         ("max_guests", "Макс. гостей"), ("description", "Описание"),
+        ("deposit", "Депозит"), ("utilities_included", "Коммуналка/что включено"),
+        ("currency", "Валюта"),
     ]
     for key, label in fields:
         b.button(text=label, callback_data=f"admin_edit_field:{property_id}:{key}")
-    b.button(text="⬅️ Отмена", callback_data="admin_menu")
+    b.button(text="🏷 Тип объекта", callback_data=f"admin_edit_type:{property_id}")
+    b.button(text="💰 Цены (все периоды)", callback_data=f"admin_edit_prices:{property_id}")
+    b.button(text="🔗 Ссылки (фото/инфо)", callback_data=f"admin_edit_links:{property_id}")
+    b.button(text="⬅️ Отмена", callback_data="admin_properties_menu")
     b.adjust(2)
+    return b.as_markup()
+
+
+def admin_edit_type_pick_kb(property_id: str) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for key, label in PROPERTY_TYPES.items():
+        b.button(text=label, callback_data=f"admin_edit_type_set:{property_id}:{key}")
+    b.button(text="⬅️ Отмена", callback_data=f"admin_edit_pick:{property_id}")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def admin_photos_menu_kb(property_id: str) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="➕ Добавить фото", callback_data=f"admin_photos_add:{property_id}")
+    b.button(text="👀 Посмотреть текущие", callback_data=f"admin_photos_view:{property_id}")
+    b.button(text="🗑 Удалить все фото", callback_data=f"admin_photos_clear:{property_id}")
+    b.button(text="⬅️ В админ-панель", callback_data="admin_properties_menu")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def admin_agents_menu_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="📋 Список + статистика", callback_data="admin_agents")
+    b.button(text="🗑 Удалить агента", callback_data="admin_agents_delete")
+    b.button(text="⬅️ В админ-панель", callback_data="admin_menu")
+    b.adjust(1)
+    return b.as_markup()
+
+
+async def admin_agents_pick_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    agents = await db.get_all_agents_with_stats()
+    for a in agents:
+        b.button(text=f"{a['name']} ({a['agency']})", callback_data=f"admin_agent_del_pick:{a['id']}")
+    b.button(text="⬅️ Отмена", callback_data="admin_agents_menu")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def admin_agent_confirm_delete_kb(agent_id: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="🗑 Да, удалить", callback_data=f"admin_agent_del_confirm:{agent_id}")
+    b.button(text="⬅️ Отмена", callback_data="admin_agents_menu")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def admin_settings_menu_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="✏️ Приветственное сообщение", callback_data="admin_setting_edit:welcome_text")
+    b.button(text="✏️ Название компании", callback_data="admin_setting_edit:company_name")
+    b.button(text="✏️ Telegram менеджера", callback_data="admin_setting_edit:contact_telegram")
+    b.button(text="✏️ Телефон", callback_data="admin_setting_edit:contact_phone")
+    b.button(text="✏️ Email", callback_data="admin_setting_edit:contact_email")
+    b.button(text="⬅️ В админ-панель", callback_data="admin_menu")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def admin_broadcast_confirm_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="📢 Отправить всем агентам", callback_data="admin_broadcast_confirm")
+    b.button(text="❌ Отмена", callback_data="admin_menu")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def back_to_admin_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ В админ-панель", callback_data="admin_menu")
+    b.adjust(1)
     return b.as_markup()
 
 
@@ -122,7 +241,7 @@ def admin_status_pick_value_kb(property_id: str) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="✅ Доступен", callback_data=f"admin_status_set:{property_id}:available")
     b.button(text="🔴 Забронирован", callback_data=f"admin_status_set:{property_id}:booked")
-    b.button(text="⬅️ Отмена", callback_data="admin_menu")
+    b.button(text="⬅️ Отмена", callback_data="admin_properties_menu")
     b.adjust(1)
     return b.as_markup()
 
@@ -130,7 +249,7 @@ def admin_status_pick_value_kb(property_id: str) -> InlineKeyboardMarkup:
 def admin_confirm_delete_kb(property_id: str) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="🗑 Да, удалить", callback_data=f"admin_delete_confirm:{property_id}")
-    b.button(text="❌ Отмена", callback_data="admin_menu")
+    b.button(text="❌ Отмена", callback_data="admin_properties_menu")
     b.adjust(1)
     return b.as_markup()
 
