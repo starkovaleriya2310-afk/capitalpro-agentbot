@@ -212,11 +212,17 @@ def _format_property_card(p: dict, show_price_hint: bool = True, price_lines: li
     if p.get("map_link"):
         lines.append(f'🗺 <a href="{p["map_link"]}">Показать на карте</a>')
 
-    if p.get("description"):
+    # Если из канала уже подтянуты "Об апартаментах"/"В комплексе" - это
+    # более полное и свежее описание, показываем его. Старое ручное поле
+    # description в этом случае не дублируем (чтобы не было двух описаний
+    # подряд об одном и том же).
+    has_channel_data = bool(p.get("amenities_unit") or p.get("amenities_complex"))
+
+    if p.get("description") and not has_channel_data:
         lines.append("")
         lines.append(p["description"])
 
-    # заполняется автоматически из постов канала Capital Pro (если публиковались)
+    # заполняется автоматически из постов канала Capital Pro
     if p.get("amenities_unit"):
         lines.append("")
         lines.append("🏠 <b>Об апартаментах:</b>")
@@ -486,6 +492,9 @@ async def cb_property_card(call: CallbackQuery, state: FSMContext):
     if len(text) > 4000:
         text = text[:3990] + "\n\n…(сокращено)"
 
+    # Сначала фото (новое сообщение всегда ложится ниже старого в чате),
+    # затем удаляем старое сообщение каталога и шлём карточку новым
+    # сообщением - так текст оказывается НИЖЕ фото, а не выше.
     photos = p.get("photos") or []
     if photos:
         media = [InputMediaPhoto(media=file_id) for file_id in photos[:4]]
@@ -494,7 +503,12 @@ async def cb_property_card(call: CallbackQuery, state: FSMContext):
         except Exception as e:
             logger.error("Не удалось отправить фото объекта %s: %s", prop_id, e)
 
-    await call.message.edit_text(
+    try:
+        await call.message.delete()
+    except Exception as e:
+        logger.warning("Не удалось удалить старое сообщение каталога: %s", e)
+
+    await call.message.answer(
         text, reply_markup=kb.property_card_kb(prop_id), disable_web_page_preview=True
     )
     await call.answer()
@@ -1610,6 +1624,17 @@ async def channel_post_album(message: Message):
 
 @router.channel_post()
 async def channel_post_single(message: Message):
+    text = message.caption or message.text
+    photos = [message.photo[-1].file_id] if message.photo else []
+    await _apply_channel_post(text, photos)
+
+
+# Редактирование поста (даже старого, опубликованного до того, как бот стал
+# админом канала) тоже присылает боту сигнал - этим можно пользоваться, чтобы
+# "досканировать" старые посты без пересылки: открыть пост в канале,
+# нажать "Редактировать", сохранить без изменений (или чуть поправив текст).
+@router.edited_channel_post()
+async def edited_channel_post_single(message: Message):
     text = message.caption or message.text
     photos = [message.photo[-1].file_id] if message.photo else []
     await _apply_channel_post(text, photos)
