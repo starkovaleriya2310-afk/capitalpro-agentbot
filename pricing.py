@@ -73,7 +73,9 @@ def calculate_stay_price(check_in: date, check_out: date, prices: list[dict]) ->
         for label in touched_periods:
             pinfo = price_by_period.get(label)
             if not pinfo:
-                continue
+                raise DateRangeError(
+                    f"Нет цены на период «{label}» для этого объекта — уточните даты у менеджера"
+                )
             amount = pinfo["price_month_thb"]
             total += amount
             breakdown.append({
@@ -108,7 +110,11 @@ def calculate_stay_price(check_in: date, check_out: date, prices: list[dict]) ->
     for label in seen:
         n = period_nights[label]
         pinfo = price_by_period.get(label)
-        rate = pinfo["price_night_thb"] if pinfo else 0
+        if not pinfo:
+            raise DateRangeError(
+                f"Нет цены на период «{label}» для этого объекта — уточните даты у менеджера"
+            )
+        rate = pinfo["price_night_thb"]
         amount = rate * n
         total += amount
         breakdown.append({
