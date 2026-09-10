@@ -335,7 +335,44 @@ async def cb_distgroup(call: CallbackQuery, state: FSMContext):
 async def cb_type_for(call: CallbackQuery, state: FSMContext):
     _, slug, prop_type = call.data.split(":", 2)
     label, districts = kb.get_group_by_slug(slug)
-    await state.update_data(catalog_type=prop_type)
+    type_label = PROPERTY_TYPES.get(prop_type, prop_type)
+    await call.message.edit_text(
+        f"{label} • {type_label}\n\nХотите сразу посмотреть все объекты, "
+        "или сначала указать даты (чтобы сразу увидеть цену и доступность)?",
+        reply_markup=kb.browse_or_dates_kb(slug, prop_type),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("browse:"))
+async def cb_browse(call: CallbackQuery, state: FSMContext):
+    _, slug, prop_type = call.data.split(":", 2)
+    label, districts = kb.get_group_by_slug(slug)
+    await state.update_data(
+        catalog_group=slug, catalog_type=prop_type,
+        catalog_check_in=None, catalog_check_out=None,
+    )
+
+    items = await db.get_properties_by_type_districts(prop_type, districts)
+    if not items:
+        await call.answer("В этом районе пока нет объектов этого типа", show_alert=True)
+        return
+
+    items_no_price = [(p, None) for p in items]
+    type_label = PROPERTY_TYPES.get(prop_type, prop_type)
+    await call.message.edit_text(
+        f"{label} • {type_label}\n\nВсе объекты ({len(items)}). Выберите, чтобы посмотреть "
+        "описание, фото и рассчитать цену на нужные даты:",
+        reply_markup=kb.properties_by_group_kb(slug, items_no_price),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("dates_for:"))
+async def cb_dates_for(call: CallbackQuery, state: FSMContext):
+    _, slug, prop_type = call.data.split(":", 2)
+    label, districts = kb.get_group_by_slug(slug)
+    await state.update_data(catalog_group=slug, catalog_type=prop_type)
     await state.set_state(CatalogFlow.dates)
     type_label = PROPERTY_TYPES.get(prop_type, prop_type)
     await call.message.edit_text(
