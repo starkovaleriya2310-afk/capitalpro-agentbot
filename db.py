@@ -107,7 +107,7 @@ async def update_property_field(property_id: str, field: str, value):
     allowed = {
         "type", "title", "district", "bedrooms", "sqm", "view", "pool_access",
         "address", "map_link", "max_guests", "currency", "description", "status",
-        "deposit", "utilities_included",
+        "deposit", "utilities_included", "amenities_unit", "amenities_complex",
     }
     if field not in allowed:
         raise ValueError(f"Field '{field}' is not editable via update_property_field")
@@ -115,6 +115,15 @@ async def update_property_field(property_id: str, field: str, value):
         await conn.execute(
             f"UPDATE properties SET {field} = $1, updated_at = now() WHERE id = $2",
             value, property_id,
+        )
+
+
+async def set_property_photos(property_id: str, photos: list[str]):
+    """Полностью заменяет список фото объекта (используется при импорте из поста канала)."""
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE properties SET photos = $1, updated_at = now() WHERE id = $2",
+            json.dumps(photos), property_id,
         )
 
 
