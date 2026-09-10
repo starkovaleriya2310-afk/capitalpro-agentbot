@@ -62,3 +62,17 @@ CREATE TABLE IF NOT EXISTS settings (
     value       TEXT,
     updated_at  TIMESTAMPTZ DEFAULT now()
 );
+
+-- Данные из постов канала Capital Pro (автоимпорт удобств по тикеру объекта)
+ALTER TABLE properties ADD COLUMN IF NOT EXISTS amenities_unit TEXT;
+ALTER TABLE properties ADD COLUMN IF NOT EXISTS amenities_complex TEXT;
+CREATE TABLE IF NOT EXISTS bookings (
+    id           SERIAL PRIMARY KEY,
+    property_id  TEXT REFERENCES properties(id) ON DELETE CASCADE,
+    check_in     DATE NOT NULL,
+    check_out    DATE NOT NULL,
+    note         TEXT,
+    created_at   TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_bookings_property ON bookings(property_id);
+CREATE INDEX IF NOT EXISTS idx_bookings_dates ON bookings(check_in, check_out);
