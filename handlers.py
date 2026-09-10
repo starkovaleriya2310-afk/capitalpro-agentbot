@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 from datetime import datetime
@@ -187,7 +188,7 @@ def _format_property_card(p: dict, show_price_hint: bool = True, price_lines: li
     status_map = {"available": "✅ Доступен", "booked": "🔴 Забронирован"}
 
     lines = [
-        f"<b>{p['title']}</b> ({p['id']})",
+        f"🌴 <b>{p['title']}</b> | {p['id']}",
         f"Статус: {status_map.get(p.get('status'), p.get('status'))}",
     ]
     if price_lines:
@@ -215,6 +216,16 @@ def _format_property_card(p: dict, show_price_hint: bool = True, price_lines: li
         lines.append("")
         lines.append(p["description"])
 
+    # заполняется автоматически из постов канала Capital Pro (если публиковались)
+    if p.get("amenities_unit"):
+        lines.append("")
+        lines.append("🏠 <b>Об апартаментах:</b>")
+        lines.append(p["amenities_unit"])
+    if p.get("amenities_complex"):
+        lines.append("")
+        lines.append("🏊‍♀️ <b>В комплексе:</b>")
+        lines.append(p["amenities_complex"])
+
     if p.get("deposit"):
         lines.append("")
         lines.append(f"💳 Депозит: {p['deposit']}")
@@ -228,7 +239,7 @@ def _format_property_card(p: dict, show_price_hint: bool = True, price_lines: li
     links = p.get("links") or []
     if links:
         lines.append("")
-        lines.append("🔗 Доп. материалы:")
+        lines.append("📸 Ссылка на фото:")
         for link in links:
             lines.append(link)
 
@@ -1515,3 +1526,83 @@ async def admin_add_type_final(call: CallbackQuery, state: FSMContext):
         f"✅ Объект {prop['id']} добавлен!", reply_markup=kb.admin_properties_menu_kb()
     )
     await call.answer("Сохранено")
+
+
+# ---------- Автоимпорт из постов канала Capital Pro ----------
+# Формат поста в канале: тикер объекта хэштегом (#NBC-A202) в начале,
+# затем при желании фото (можно альбомом) и текст с заголовками
+# "Об апартаментах:" и "В комплексе:" — бот сам подтянет это в карточку объекта.
+
+TICKER_RE = re.compile(r"#([A-Za-zА-Яа-я0-9\-/]+)")
+SECTION_RE_TEMPLATE = r"{label}\s*:?\s*\n(.*?)(?=\n[А-ЯЁ][^\n:]{{0,40}}:|\Z)"
+
+# буфер для сбора фото из альбома (несколько сообщений с одним media_group_id)
+_channel_album_buffer: dict[str, dict] = {}
+
+
+def _parse_channel_post(text: str) -> tuple[str | None, str | None, str | None]:
+    """Возвращает (ticker, текст 'Об апартаментах', текст 'В комплексе') из текста поста."""
+    if not text:
+        return None, None, None
+    m = TICKER_RE.search(text)
+    ticker = m.group(1) if m else None
+
+    def extract_section(label: str) -> str | None:
+        pattern = SECTION_RE_TEMPLATE.format(label=re.escape(label))
+        m2 = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+        return m2.group(1).strip() if m2 else None
+
+    unit = extract_section("Об апартаментах")
+    complex_ = extract_section("В комплексе")
+    return ticker, unit, complex_
+
+
+async def _apply_channel_post(text: str | None, photos: list[str]):
+    ticker, unit, complex_ = _parse_channel_post(text or "")
+    if not ticker:
+        return
+
+    p = await db.get_property_by_id(ticker)
+    if not p:
+        logger.warning("Пост в канале ссылается на неизвестный тикер объекта: %s", ticker)
+        return
+
+    if unit:
+        await db.update_property_field(ticker, "amenities_unit", unit)
+    if complex_:
+        await db.update_property_field(ticker, "amenities_complex", complex_)
+    if photos:
+        await db.set_property_photos(ticker, photos)
+
+    logger.info(
+        "Обновлён объект %s из поста канала (фото: %d, доб. удобства: %s, комплекс: %s)",
+        ticker, len(photos), bool(unit), bool(complex_),
+    )
+
+
+async def _process_channel_album(media_group_id: str):
+    await asyncio.sleep(1.5)  # ждём, пока придут все фото альбома
+    data = _channel_album_buffer.pop(media_group_id, None)
+    if not data:
+        return
+    await _apply_channel_post(data.get("text"), data.get("photos", []))
+
+
+@router.channel_post(F.media_group_id)
+async def channel_post_album(message: Message):
+    gid = message.media_group_id
+    buf = _channel_album_buffer.setdefault(gid, {"photos": [], "text": None, "task": None})
+    if message.photo:
+        buf["photos"].append(message.photo[-1].file_id)
+    if message.caption:
+        buf["text"] = message.caption
+    if buf["task"]:
+        buf["task"].cancel()
+    buf["task"] = asyncio.create_task(_process_channel_album(gid))
+
+
+@router.channel_post()
+async def channel_post_single(message: Message):
+    text = message.caption or message.text
+    photos = [message.photo[-1].file_id] if message.photo else []
+    await _apply_channel_post(text, photos)
