@@ -10,6 +10,9 @@ DISTRICT_GROUPS = [
     ("rawai_naiharn", "📍 Rawai / Naiharn", ["Rawai", "Naiharn"]),
     ("kata_karon", "📍 Kata / Karon", ["Kata", "Karon"]),
     ("bangtao", "📍 Bangtao", ["Bangtao"]),
+    ("layan", "📍 Layan", ["Layan"]),
+    ("surin", "📍 Surin", ["Surin"]),
+    ("kamala", "📍 Kamala", ["Kamala"]),
     ("naiyang", "📍 Naiyang", ["Naiyang"]),
     ("maikhao", "📍 Maikhao", ["Maikhao"]),
 ]
@@ -50,6 +53,15 @@ def types_for_group_kb(slug: str, types: list[str]) -> InlineKeyboardMarkup:
         label = PROPERTY_TYPES.get(t, t)
         b.button(text=label, callback_data=f"type_for:{slug}:{t}")
     b.button(text="⬅️ К районам", callback_data="catalog")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def browse_or_dates_kb(slug: str, prop_type: str) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="📋 Показать все объекты", callback_data=f"browse:{slug}:{prop_type}")
+    b.button(text="📅 Указать даты (сразу с ценой)", callback_data=f"dates_for:{slug}:{prop_type}")
+    b.button(text="⬅️ К типам", callback_data=f"distgroup:{slug}")
     b.adjust(1)
     return b.as_markup()
 
