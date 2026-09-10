@@ -4,6 +4,23 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from config import PROPERTY_TYPES
 import db
 
+# Группы районов для нового флоу "Район → Тип". Rawai/Naiharn и Kata/Karon
+# объединены в одну кнопку — у них общая небольшая база объектов.
+DISTRICT_GROUPS = [
+    ("rawai_naiharn", "📍 Rawai / Naiharn", ["Rawai", "Naiharn"]),
+    ("kata_karon", "📍 Kata / Karon", ["Kata", "Karon"]),
+    ("bangtao", "📍 Bangtao", ["Bangtao"]),
+    ("naiyang", "📍 Naiyang", ["Naiyang"]),
+    ("maikhao", "📍 Maikhao", ["Maikhao"]),
+]
+
+
+def get_group_by_slug(slug: str):
+    for s, label, districts in DISTRICT_GROUPS:
+        if s == slug:
+            return label, districts
+    return None, []
+
 
 def main_menu_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
@@ -16,11 +33,23 @@ def main_menu_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-def catalog_types_kb() -> InlineKeyboardMarkup:
+async def district_groups_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    for key, label in PROPERTY_TYPES.items():
-        b.button(text=label, callback_data=f"type:{key}")
+    existing = set(await db.get_all_districts())
+    for slug, label, districts in DISTRICT_GROUPS:
+        if any(d in existing for d in districts):
+            b.button(text=label, callback_data=f"distgroup:{slug}")
     b.button(text="⬅️ В главное меню", callback_data="main_menu")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def types_for_group_kb(slug: str, types: list[str]) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for t in types:
+        label = PROPERTY_TYPES.get(t, t)
+        b.button(text=label, callback_data=f"type_for:{slug}:{t}")
+    b.button(text="⬅️ К районам", callback_data="catalog")
     b.adjust(1)
     return b.as_markup()
 
@@ -37,16 +66,7 @@ async def properties_list_kb(property_type: str) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-def district_list_kb(districts: list[str]) -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    for d in districts:
-        b.button(text=f"📍 {d}", callback_data=f"district:{d}")
-    b.button(text="⬅️ Изменить тип объекта", callback_data="catalog")
-    b.adjust(1)
-    return b.as_markup()
-
-
-def properties_by_district_kb(items_with_price: list[tuple]) -> InlineKeyboardMarkup:
+def properties_by_group_kb(slug: str, items_with_price: list[tuple]) -> InlineKeyboardMarkup:
     """items_with_price: список (property_dict, total_thb или None)"""
     b = InlineKeyboardBuilder()
     for p, total in items_with_price:
@@ -60,7 +80,7 @@ def properties_by_district_kb(items_with_price: list[tuple]) -> InlineKeyboardMa
             max_title_len = 64 - len(price_part) - 1
             label = f"{title[:max_title_len]}…{price_part}"
         b.button(text=label, callback_data=f"prop:{p['id']}")
-    b.button(text="⬅️ К районам", callback_data="back_to_districts")
+    b.button(text="⬅️ К районам", callback_data="catalog")
     b.adjust(1)
     return b.as_markup()
 
@@ -69,7 +89,7 @@ def property_card_kb(property_id: str) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="📅 Рассчитать цену на другие даты", callback_data=f"calc_price:{property_id}")
     b.button(text="📝 Заявка по этому объекту", callback_data=f"lead_for:{property_id}")
-    b.button(text="⬅️ К списку объектов", callback_data="back_to_districts")
+    b.button(text="⬅️ К каталогу", callback_data="catalog")
     b.button(text="🏠 В главное меню", callback_data="main_menu")
     b.adjust(1)
     return b.as_markup()
@@ -127,6 +147,7 @@ def admin_properties_menu_kb() -> InlineKeyboardMarkup:
     b.button(text="✏️ Редактировать объект", callback_data="admin_edit")
     b.button(text="🖼 Фото объекта", callback_data="admin_photos")
     b.button(text="🔄 Статус (доступен/забронирован)", callback_data="admin_status")
+    b.button(text="📅 Брони / занятость", callback_data="admin_bookings")
     b.button(text="🗑 Удалить объект", callback_data="admin_delete")
     b.button(text="⬅️ В админ-панель", callback_data="admin_menu")
     b.adjust(1)
@@ -267,5 +288,24 @@ def after_calc_kb(property_id: str) -> InlineKeyboardMarkup:
     b.button(text="📝 Заявка на эти даты", callback_data=f"lead_for:{property_id}")
     b.button(text="📅 Другие даты", callback_data=f"calc_price:{property_id}")
     b.button(text="⬅️ К объекту", callback_data=f"prop:{property_id}")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def admin_bookings_menu_kb(property_id: str) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="➕ Добавить бронь", callback_data=f"admin_booking_add:{property_id}")
+    b.button(text="📋 Список броней", callback_data=f"admin_booking_list:{property_id}")
+    b.button(text="⬅️ В админ-панель", callback_data="admin_properties_menu")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def admin_booking_delete_kb(property_id: str, bookings: list[dict]) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for bk in bookings:
+        label = f"{bk['check_in'].strftime('%d.%m.%y')} - {bk['check_out'].strftime('%d.%m.%y')}"
+        b.button(text=f"🗑 {label}", callback_data=f"admin_booking_del:{bk['id']}:{property_id}")
+    b.button(text="⬅️ Назад", callback_data=f"admin_bookings_back:{property_id}")
     b.adjust(1)
     return b.as_markup()
