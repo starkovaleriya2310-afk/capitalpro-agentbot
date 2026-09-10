@@ -492,16 +492,29 @@ async def cb_property_card(call: CallbackQuery, state: FSMContext):
     if len(text) > 4000:
         text = text[:3990] + "\n\n…(сокращено)"
 
+    # Удаляем альбом фото прошлого открытого объекта (если был) - иначе
+    # фото копятся в чате при переключении между объектами.
+    old_photo_ids = data.get("last_photo_msg_ids") or []
+    for mid in old_photo_ids:
+        try:
+            await call.bot.delete_message(call.message.chat.id, mid)
+        except Exception as e:
+            logger.warning("Не удалось удалить старое фото (msg_id %s): %s", mid, e)
+
     # Сначала фото (новое сообщение всегда ложится ниже старого в чате),
     # затем удаляем старое сообщение каталога и шлём карточку новым
     # сообщением - так текст оказывается НИЖЕ фото, а не выше.
     photos = p.get("photos") or []
+    sent_photo_ids: list[int] = []
     if photos:
         media = [InputMediaPhoto(media=file_id) for file_id in photos[:4]]
         try:
-            await call.message.answer_media_group(media=media)
+            sent_msgs = await call.message.answer_media_group(media=media)
+            sent_photo_ids = [m.message_id for m in sent_msgs]
         except Exception as e:
             logger.error("Не удалось отправить фото объекта %s: %s", prop_id, e)
+
+    await state.update_data(last_photo_msg_ids=sent_photo_ids)
 
     try:
         await call.message.delete()
@@ -1549,7 +1562,20 @@ async def admin_add_type_final(call: CallbackQuery, state: FSMContext):
 
 TICKER_TITLE_RE = re.compile(r"\|\s*([A-ZА-Я0-9]+(?:[-/][A-Za-zА-Яа-я0-9]+)*)")
 TICKER_HASH_RE = re.compile(r"#([A-Za-zА-Яа-я0-9\-/]+)")
-SECTION_RE_TEMPLATE = r"{label}\s*:?\s*\n(.*?)(?=\n[А-ЯЁ][^\n:]{{0,40}}:|\Z)"
+
+# Все заголовки разделов, которые встречаются в постах канала — по ним
+# определяем, где заканчивается блок "Об апартаментах"/"В комплексе".
+# В канале перед заголовком обычно стоит эмодзи (📍 Рядом:, 💰 Условия
+# аренды:) — поэтому перед текстом заголовка разрешаем до 6 любых
+# символов (сам эмодзи + пробел), а не требуем заглавную букву сразу.
+SECTION_HEADERS = [
+    "Об апартаментах",
+    "В комплексе",
+    "Рядом",
+    "Условия аренды",
+    "Для бронирования",
+    "Ссылка на фото",
+]
 
 # буфер для сбора фото из альбома (несколько сообщений с одним media_group_id)
 _channel_album_buffer: dict[str, dict] = {}
@@ -1569,9 +1595,24 @@ def _parse_channel_post(text: str) -> tuple[str | None, str | None, str | None]:
     ticker = m.group(1).strip() if m else None
 
     def extract_section(label: str) -> str | None:
-        pattern = SECTION_RE_TEMPLATE.format(label=re.escape(label))
-        m2 = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-        return m2.group(1).strip() if m2 else None
+        # ищем сам заголовок (с эмодзи перед ним, если есть)
+        start_m = re.search(
+            rf"(?:^|\n).{{0,6}}{re.escape(label)}\s*:?\s*\n",
+            text, re.IGNORECASE,
+        )
+        if not start_m:
+            return None
+        start = start_m.end()
+
+        # ищем ближайший следующий известный заголовок раздела - там блок кончается
+        other_labels = [h for h in SECTION_HEADERS if h != label]
+        stop_pattern = "|".join(re.escape(h) for h in other_labels)
+        stop_m = re.search(
+            rf"\n.{{0,6}}(?:{stop_pattern})\s*:?\s*\n",
+            text[start:], re.IGNORECASE,
+        )
+        end = start + stop_m.start() if stop_m else len(text)
+        return text[start:end].strip() or None
 
     unit = extract_section("Об апартаментах")
     complex_ = extract_section("В комплексе")
