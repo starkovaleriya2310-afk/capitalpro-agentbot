@@ -1533,7 +1533,8 @@ async def admin_add_type_final(call: CallbackQuery, state: FSMContext):
 # затем при желании фото (можно альбомом) и текст с заголовками
 # "Об апартаментах:" и "В комплексе:" — бот сам подтянет это в карточку объекта.
 
-TICKER_RE = re.compile(r"#([A-Za-zА-Яа-я0-9\-/]+)")
+TICKER_TITLE_RE = re.compile(r"\|\s*([A-ZА-Я0-9]+(?:[-/][A-Za-zА-Яа-я0-9]+)*)")
+TICKER_HASH_RE = re.compile(r"#([A-Za-zА-Яа-я0-9\-/]+)")
 SECTION_RE_TEMPLATE = r"{label}\s*:?\s*\n(.*?)(?=\n[А-ЯЁ][^\n:]{{0,40}}:|\Z)"
 
 # буфер для сбора фото из альбома (несколько сообщений с одним media_group_id)
@@ -1541,11 +1542,17 @@ _channel_album_buffer: dict[str, dict] = {}
 
 
 def _parse_channel_post(text: str) -> tuple[str | None, str | None, str | None]:
-    """Возвращает (ticker, текст 'Об апартаментах', текст 'В комплексе') из текста поста."""
+    """Возвращает (ticker, текст 'Об апартаментах', текст 'В комплексе') из текста поста.
+    Тикер ищем в заголовке после "|" (формат "Название | NBC-A807"),
+    а если там нет — пробуем хэштег #ТИКЕР где угодно в тексте."""
     if not text:
         return None, None, None
-    m = TICKER_RE.search(text)
-    ticker = m.group(1) if m else None
+
+    first_line = text.split("\n", 1)[0]
+    m = TICKER_TITLE_RE.search(first_line)
+    if not m:
+        m = TICKER_HASH_RE.search(text)
+    ticker = m.group(1).strip() if m else None
 
     def extract_section(label: str) -> str | None:
         pattern = SECTION_RE_TEMPLATE.format(label=re.escape(label))
