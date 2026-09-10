@@ -1606,3 +1606,66 @@ async def channel_post_single(message: Message):
     text = message.caption or message.text
     photos = [message.photo[-1].file_id] if message.photo else []
     await _apply_channel_post(text, photos)
+
+
+# ---------- Пересланные старые посты (задним числом) ----------
+# Бот через обычный API не видит историю канала до момента, когда его туда
+# добавили. Чтобы подтянуть данные из уже опубликованных постов - админ
+# пересылает их боту в личку (форвард сохраняет фото и текст поста).
+
+_forward_album_buffer: dict[str, dict] = {}
+
+
+async def _handle_reimport_result(message: Message, ticker: str | None, unit, complex_, photos: list[str]):
+    if not ticker:
+        await message.answer("⚠️ Не нашёл тикер объекта (#ТИКЕР) в этом посте.")
+        return
+    p = await db.get_property_by_id(ticker)
+    if not p:
+        await message.answer(f"⚠️ Объект с тикером {ticker} не найден в базе.")
+        return
+    if unit:
+        await db.update_property_field(ticker, "amenities_unit", unit)
+    if complex_:
+        await db.update_property_field(ticker, "amenities_complex", complex_)
+    if photos:
+        await db.set_property_photos(ticker, photos)
+    await message.answer(
+        f"✅ Обновил <b>{ticker}</b> из пересланного поста "
+        f"(фото: {len(photos)}, доп. удобства: {'да' if unit else 'нет'}, "
+        f"комплекс: {'да' if complex_ else 'нет'})."
+    )
+
+
+async def _process_forward_album(media_group_id: str, message: Message):
+    await asyncio.sleep(1.5)
+    data = _forward_album_buffer.pop(media_group_id, None)
+    if not data:
+        return
+    ticker, unit, complex_ = _parse_channel_post(data.get("text") or "")
+    await _handle_reimport_result(message, ticker, unit, complex_, data.get("photos", []))
+
+
+@router.message(F.chat.type == "private", F.media_group_id, F.forward_origin)
+async def forwarded_album(message: Message):
+    if message.from_user.id != ADMIN_TELEGRAM_ID:
+        return
+    gid = message.media_group_id
+    buf = _forward_album_buffer.setdefault(gid, {"photos": [], "text": None, "task": None})
+    if message.photo:
+        buf["photos"].append(message.photo[-1].file_id)
+    if message.caption:
+        buf["text"] = message.caption
+    if buf["task"]:
+        buf["task"].cancel()
+    buf["task"] = asyncio.create_task(_process_forward_album(gid, message))
+
+
+@router.message(F.chat.type == "private", F.forward_origin)
+async def forwarded_single(message: Message):
+    if message.from_user.id != ADMIN_TELEGRAM_ID:
+        return
+    text = message.caption or message.text
+    photos = [message.photo[-1].file_id] if message.photo else []
+    ticker, unit, complex_ = _parse_channel_post(text or "")
+    await _handle_reimport_result(message, ticker, unit, complex_, photos)
