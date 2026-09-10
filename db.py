@@ -424,18 +424,24 @@ async def get_bookings_for_property(property_id: str, upcoming_only: bool = True
 
 async def get_overlapping_bookings(property_id: str, check_in, check_out) -> list[dict]:
     """Брони, пересекающиеся с указанным диапазоном [check_in, check_out)."""
-    async with _pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT * FROM bookings
-            WHERE property_id = $1
-              AND check_in < $3
-              AND check_out > $2
-            ORDER BY check_in
-            """,
-            property_id, check_in, check_out,
-        )
-        return [dict(r) for r in rows]
+    try:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM bookings
+                WHERE property_id = $1
+                  AND check_in < $3
+                  AND check_out > $2
+                ORDER BY check_in
+                """,
+                property_id, check_in, check_out,
+            )
+            return [dict(r) for r in rows]
+    except asyncpg.exceptions.UndefinedTableError:
+        # таблица bookings ещё не создана в этой БД (не применена schema.sql) -
+        # не роняем бота, считаем что броней нет
+        logger.warning("Таблица bookings не найдена - пропускаю проверку занятости")
+        return []
 
 
 async def is_property_available(property_id: str, check_in, check_out) -> bool:
