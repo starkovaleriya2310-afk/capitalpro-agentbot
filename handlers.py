@@ -88,6 +88,11 @@ class AdminBroadcast(StatesGroup):
     confirming = State()
 
 
+class AdminBooking(StatesGroup):
+    dates = State()
+    note = State()
+
+
 WELCOME_TEXT = (
     f"🌴 Привет! Это <b>{COMPANY_NAME}</b>\n\n"
     "Помогаем агентам быстро находить и бронировать виллы и апартаменты для "
@@ -176,7 +181,7 @@ def _parse_prices_text(text: str) -> list[dict]:
     return result
 
 
-def _format_property_card(p: dict, show_price_hint: bool = True) -> str:
+def _format_property_card(p: dict, show_price_hint: bool = True, price_lines: list[str] | None = None) -> str:
     bedrooms = p.get("bedrooms")
     bedrooms_text = "студия" if bedrooms == 0 else (str(bedrooms) if bedrooms is not None else "—")
     status_map = {"available": "✅ Доступен", "booked": "🔴 Забронирован"}
@@ -184,8 +189,13 @@ def _format_property_card(p: dict, show_price_hint: bool = True) -> str:
     lines = [
         f"<b>{p['title']}</b> ({p['id']})",
         f"Статус: {status_map.get(p.get('status'), p.get('status'))}",
-        f"📍 Район: {p.get('district') or '—'}",
     ]
+    if price_lines:
+        lines.append("")
+        lines.extend(price_lines)
+
+    lines.append("")
+    lines.append(f"📍 Район: {p.get('district') or '—'}")
     if p.get("sqm"):
         lines.append(f"📐 Площадь: {p['sqm']} м²")
     lines.append(f"🛏 Спальни: {bedrooms_text}")
@@ -209,7 +219,7 @@ def _format_property_card(p: dict, show_price_hint: bool = True) -> str:
         lines.append("")
         lines.append(f"💳 Депозит: {p['deposit']}")
     if p.get("utilities_included"):
-        lines.append(f"🔌 Коммунальные услуги: {p['utilities_included']}")
+        lines.append(p["utilities_included"])
 
     lines.append("")
     if show_price_hint:
@@ -289,22 +299,47 @@ async def cb_main_menu(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-# ---------- Каталог: тип -> даты -> район -> список ----------
+# ---------- Каталог: район -> тип -> даты -> список ----------
 @router.callback_query(F.data == "catalog")
 async def cb_catalog(call: CallbackQuery, state: FSMContext):
-    await state.update_data(catalog_type=None, catalog_check_in=None, catalog_check_out=None, catalog_district=None)
-    await call.message.edit_text("🏡 Выберите тип объекта:", reply_markup=kb.catalog_types_kb())
+    await state.update_data(
+        catalog_group=None, catalog_type=None, catalog_check_in=None, catalog_check_out=None
+    )
+    markup = await kb.district_groups_kb()
+    await call.message.edit_text("📍 Выберите район:", reply_markup=markup)
     await call.answer()
 
 
-@router.callback_query(F.data.startswith("type:"))
-async def cb_type(call: CallbackQuery, state: FSMContext):
-    prop_type = call.data.split(":", 1)[1]
+@router.callback_query(F.data.startswith("distgroup:"))
+async def cb_distgroup(call: CallbackQuery, state: FSMContext):
+    slug = call.data.split(":", 1)[1]
+    label, districts = kb.get_group_by_slug(slug)
+    if not districts:
+        await call.answer("Район не найден", show_alert=True)
+        return
+    await state.update_data(catalog_group=slug)
+
+    types = await db.get_types_by_districts(districts)
+    if not types:
+        await call.answer("В этом районе пока нет доступных объектов", show_alert=True)
+        return
+
+    await call.message.edit_text(
+        f"{label}\n\nВыберите тип объекта:",
+        reply_markup=kb.types_for_group_kb(slug, types),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("type_for:"))
+async def cb_type_for(call: CallbackQuery, state: FSMContext):
+    _, slug, prop_type = call.data.split(":", 2)
+    label, districts = kb.get_group_by_slug(slug)
     await state.update_data(catalog_type=prop_type)
     await state.set_state(CatalogFlow.dates)
-    label = PROPERTY_TYPES.get(prop_type, prop_type)
+    type_label = PROPERTY_TYPES.get(prop_type, prop_type)
     await call.message.edit_text(
-        f"{label}\n\n{DATES_FORMAT_HINT}",
+        f"{label} • {type_label}\n\n{DATES_FORMAT_HINT}",
         reply_markup=kb.cancel_kb(),
     )
     await call.answer()
@@ -324,40 +359,17 @@ async def catalog_dates(message: Message, state: FSMContext):
     )
     await state.set_state(None)
 
+    slug = data["catalog_group"]
     prop_type = data["catalog_type"]
-    districts = await db.get_districts_by_type(prop_type)
-    if not districts:
-        await message.answer(
-            "По этому типу объектов пока нет доступных вариантов.",
-            reply_markup=kb.main_menu_kb(is_admin(message.from_user.id)),
-        )
-        return
+    group_label, districts = kb.get_group_by_slug(slug)
 
-    label = PROPERTY_TYPES.get(prop_type, prop_type)
-    await message.answer(
-        f"{label}\n📅 {check_in.strftime('%d.%m.%Y')} → {check_out.strftime('%d.%m.%Y')}\n\n"
-        "Выберите район:",
-        reply_markup=kb.district_list_kb(districts),
-    )
-
-
-@router.callback_query(F.data.startswith("district:"))
-async def cb_district(call: CallbackQuery, state: FSMContext):
-    district = call.data.split(":", 1)[1]
-    data = await state.get_data()
-    prop_type = data.get("catalog_type")
-    await state.update_data(catalog_district=district)
-
-    items = await db.get_properties_by_type_district(prop_type, district)
-    if not items:
-        await call.answer("В этом районе пока нет доступных объектов", show_alert=True)
-        return
-
-    check_in = datetime.fromisoformat(data["catalog_check_in"]).date()
-    check_out = datetime.fromisoformat(data["catalog_check_out"]).date()
-
+    items = await db.get_properties_by_type_districts(prop_type, districts)
     items_with_price = []
+    hidden_count = 0
     for p in items:
+        if not await db.is_property_available(p["id"], check_in, check_out):
+            hidden_count += 1
+            continue
         try:
             result = pricing.calculate_stay_price(check_in, check_out, p.get("prices") or [])
             total = result["total_thb"]
@@ -365,25 +377,23 @@ async def cb_district(call: CallbackQuery, state: FSMContext):
             total = None
         items_with_price.append((p, total))
 
-    label = PROPERTY_TYPES.get(prop_type, prop_type)
-    await call.message.edit_text(
-        f"{label} • 📍 {district}\n📅 {check_in.strftime('%d.%m.%Y')} → {check_out.strftime('%d.%m.%Y')}\n\n"
-        "Выберите объект (цена указана за весь период):",
-        reply_markup=kb.properties_by_district_kb(items_with_price),
-    )
-    await call.answer()
+    if not items_with_price:
+        markup = await kb.district_groups_kb()
+        await message.answer(
+            f"На эти даты в {group_label} все объекты уже забронированы "
+            f"({hidden_count} объектов заняты). Попробуйте другие даты, либо выберите другой район.",
+            reply_markup=markup,
+        )
+        return
 
-
-@router.callback_query(F.data == "back_to_districts")
-async def cb_back_to_districts(call: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    prop_type = data.get("catalog_type")
-    districts = await db.get_districts_by_type(prop_type)
-    label = PROPERTY_TYPES.get(prop_type, prop_type)
-    await call.message.edit_text(
-        f"{label}\n\nВыберите район:", reply_markup=kb.district_list_kb(districts)
+    type_label = PROPERTY_TYPES.get(prop_type, prop_type)
+    hidden_note = f" ({hidden_count} занято на эти даты, скрыто)" if hidden_count else ""
+    await message.answer(
+        f"{group_label} • {type_label}\n📅 {check_in.strftime('%d.%m.%Y')} → {check_out.strftime('%d.%m.%Y')}"
+        f"{hidden_note}\n\nВыберите объект (цена указана за весь период):",
+        reply_markup=kb.properties_by_group_kb(slug, items_with_price),
     )
-    await call.answer()
+
 
 
 @router.callback_query(F.data.startswith("prop:"))
@@ -396,38 +406,41 @@ async def cb_property_card(call: CallbackQuery, state: FSMContext):
     await state.update_data(last_property_id=prop_id)
 
     data = await state.get_data()
-    text = _format_property_card(p, show_price_hint=not (data.get("catalog_check_in") and data.get("catalog_check_out")))
 
     ci_raw, co_raw = data.get("catalog_check_in"), data.get("catalog_check_out")
+    price_lines = None
     if ci_raw and co_raw:
         check_in = datetime.fromisoformat(ci_raw).date()
         check_out = datetime.fromisoformat(co_raw).date()
+        overlapping = await db.get_overlapping_bookings(prop_id, check_in, check_out)
+        price_lines = []
+        if overlapping:
+            price_lines.append("🔴 <b>На эти даты уже есть бронь:</b>")
+            for bk in overlapping:
+                price_lines.append(f"  {bk['check_in'].strftime('%d.%m.%Y')} - {bk['check_out'].strftime('%d.%m.%Y')}")
+            price_lines.append("")
         try:
             result = pricing.calculate_stay_price(check_in, check_out, p.get("prices") or [])
-            price_lines = [
+            price_lines += [
                 f"📅 {check_in.strftime('%d.%m.%Y')} → {check_out.strftime('%d.%m.%Y')} "
                 f"({result['nights']} ноч.)",
+                f"💰 <b>Итого: {result['total_thb']:,} THB</b>".replace(",", " "),
             ]
-            for item in result["breakdown"]:
-                if item["nights"] is None:
-                    price_lines.append(f"• {item['period']}: {item['amount']:,} THB".replace(",", " "))
-                else:
-                    price_lines.append(
-                        f"• {item['period']}: {item['nights']} × {item['rate']:,} = {item['amount']:,} THB".replace(",", " ")
-                    )
-            price_lines.append(f"💰 <b>Итого: {result['total_thb']:,} THB</b>".replace(",", " "))
             if result["peak_rule_applied"]:
                 price_lines.append(PEAK_RULE_NOTE)
-            text = "\n".join(price_lines) + "\n\n" + text
         except pricing.DateRangeError:
-            pass
+            price_lines = None
+
+    text = _format_property_card(
+        p, show_price_hint=not (ci_raw and co_raw), price_lines=price_lines
+    )
 
     if len(text) > 4000:
         text = text[:3990] + "\n\n…(сокращено)"
 
     photos = p.get("photos") or []
     if photos:
-        media = [InputMediaPhoto(media=file_id) for file_id in photos[:10]]
+        media = [InputMediaPhoto(media=file_id) for file_id in photos[:4]]
         try:
             await call.message.answer_media_group(media=media)
         except Exception as e:
@@ -487,14 +500,12 @@ async def calc_price_dates(message: Message, state: FSMContext):
         f"Ночей: {result['nights']}",
         "",
     ]
-    for item in result["breakdown"]:
-        if item["nights"] is None:
-            lines.append(f"• {item['period']}: {item['amount']:,} THB ({item['note']})".replace(",", " "))
-        else:
-            lines.append(
-                f"• {item['period']}: {item['nights']} ноч. × {item['rate']:,} = {item['amount']:,} THB".replace(",", " ")
-            )
-    lines.append("")
+    overlapping = await db.get_overlapping_bookings(prop_id, check_in, check_out)
+    if overlapping:
+        lines.insert(0, "🔴 <b>Внимание: на эти даты уже есть бронь:</b>")
+        for bk in overlapping:
+            lines.insert(1, f"  {bk['check_in'].strftime('%d.%m.%Y')} - {bk['check_out'].strftime('%d.%m.%Y')}")
+        lines.insert(len(overlapping) + 1, "")
     lines.append(f"💰 <b>Итого: {result['total_thb']:,} THB</b>".replace(",", " "))
     if result["peak_rule_applied"]:
         lines.append("")
@@ -935,6 +946,113 @@ async def cb_admin_delete_confirm(call: CallbackQuery):
     await db.delete_property(prop_id)
     await call.message.edit_text(f"Объект {prop_id} удалён.", reply_markup=kb.admin_properties_menu_kb())
     await call.answer("Удалено")
+
+
+# ---- Брони / занятость ----
+@router.callback_query(F.data == "admin_bookings")
+async def cb_admin_bookings(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Доступ запрещён", show_alert=True)
+        return
+    markup = await kb.admin_pick_property_kb("admin_bookings_pick")
+    await call.message.edit_text("Выберите объект:", reply_markup=markup)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("admin_bookings_pick:"))
+async def cb_admin_bookings_pick(call: CallbackQuery):
+    prop_id = call.data.split(":", 1)[1]
+    await call.message.edit_text(
+        f"📅 Брони объекта {prop_id}:", reply_markup=kb.admin_bookings_menu_kb(prop_id)
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("admin_bookings_back:"))
+async def cb_admin_bookings_back(call: CallbackQuery):
+    prop_id = call.data.split(":", 1)[1]
+    await call.message.edit_text(
+        f"📅 Брони объекта {prop_id}:", reply_markup=kb.admin_bookings_menu_kb(prop_id)
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("admin_booking_add:"))
+async def cb_admin_booking_add(call: CallbackQuery, state: FSMContext):
+    prop_id = call.data.split(":", 1)[1]
+    await state.update_data(booking_property_id=prop_id)
+    await state.set_state(AdminBooking.dates)
+    await call.message.edit_text(f"Добавляем бронь.\n\n{DATES_FORMAT_HINT}")
+    await call.answer()
+
+
+@router.message(AdminBooking.dates)
+async def admin_booking_dates(message: Message, state: FSMContext):
+    try:
+        check_in, check_out = _parse_date_range(message.text)
+    except ValueError as e:
+        await message.answer(f"⚠️ {e}.\n\n{DATES_FORMAT_HINT}")
+        return
+    await state.update_data(booking_check_in=check_in.isoformat(), booking_check_out=check_out.isoformat())
+    await state.set_state(AdminBooking.note)
+    await message.answer("Комментарий к брони (имя гостя/источник, или '-' если не нужно):")
+
+
+@router.message(AdminBooking.note)
+async def admin_booking_note(message: Message, state: FSMContext):
+    note = message.text.strip()
+    data = await state.get_data()
+    prop_id = data["booking_property_id"]
+    check_in = datetime.fromisoformat(data["booking_check_in"]).date()
+    check_out = datetime.fromisoformat(data["booking_check_out"]).date()
+    await db.add_booking(prop_id, check_in, check_out, None if note == "-" else note)
+    await state.clear()
+    await message.answer(
+        f"✅ Бронь добавлена: {check_in.strftime('%d.%m.%Y')} - {check_out.strftime('%d.%m.%Y')}",
+        reply_markup=kb.admin_bookings_menu_kb(prop_id),
+    )
+
+
+@router.callback_query(F.data.startswith("admin_booking_list:"))
+async def cb_admin_booking_list(call: CallbackQuery):
+    prop_id = call.data.split(":", 1)[1]
+    bookings = await db.get_bookings_for_property(prop_id)
+    if not bookings:
+        await call.message.edit_text(
+            f"У объекта {prop_id} пока нет активных броней.",
+            reply_markup=kb.admin_bookings_menu_kb(prop_id),
+        )
+        await call.answer()
+        return
+    lines = [f"📋 <b>Брони {prop_id}</b> (нажмите, чтобы удалить):\n"]
+    for bk in bookings:
+        note_part = f" — {bk['note']}" if bk.get("note") else ""
+        lines.append(f"• {bk['check_in'].strftime('%d.%m.%Y')} - {bk['check_out'].strftime('%d.%m.%Y')}{note_part}")
+    await call.message.edit_text(
+        "\n".join(lines), reply_markup=kb.admin_booking_delete_kb(prop_id, bookings)
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("admin_booking_del:"))
+async def cb_admin_booking_del(call: CallbackQuery):
+    _, booking_id_str, prop_id = call.data.split(":", 2)
+    await db.delete_booking(int(booking_id_str))
+    await call.answer("Бронь удалена")
+    bookings = await db.get_bookings_for_property(prop_id)
+    if not bookings:
+        await call.message.edit_text(
+            f"У объекта {prop_id} больше нет активных броней.",
+            reply_markup=kb.admin_bookings_menu_kb(prop_id),
+        )
+        return
+    lines = [f"📋 <b>Брони {prop_id}</b> (нажмите, чтобы удалить):\n"]
+    for bk in bookings:
+        note_part = f" — {bk['note']}" if bk.get("note") else ""
+        lines.append(f"• {bk['check_in'].strftime('%d.%m.%Y')} - {bk['check_out'].strftime('%d.%m.%Y')}{note_part}")
+    await call.message.edit_text(
+        "\n".join(lines), reply_markup=kb.admin_booking_delete_kb(prop_id, bookings)
+    )
 
 
 # ---- Быстрый статус ----
