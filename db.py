@@ -210,6 +210,41 @@ async def get_districts_by_type(prop_type: str) -> list[str]:
         return [r["district"] for r in rows]
 
 
+async def get_all_districts() -> list[str]:
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT DISTINCT district FROM properties WHERE status = 'available' AND district IS NOT NULL"
+        )
+        return [r["district"] for r in rows]
+
+
+async def get_types_by_districts(districts: list[str]) -> list[str]:
+    """Какие типы объектов реально есть в наборе районов (для группового выбора Rawai/Naiharn и т.п.)."""
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT DISTINCT type FROM properties
+            WHERE district = ANY($1::text[]) AND status = 'available' AND type IS NOT NULL
+            ORDER BY type
+            """,
+            districts,
+        )
+        return [r["type"] for r in rows]
+
+
+async def get_properties_by_type_districts(prop_type: str, districts: list[str]) -> list[dict]:
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT * FROM properties
+            WHERE type = $1 AND district = ANY($2::text[]) AND status = 'available'
+            ORDER BY title
+            """,
+            prop_type, districts,
+        )
+        return [_row_to_property(r) for r in rows]
+
+
 async def get_properties_by_type_district(prop_type: str, district: str) -> list[dict]:
     async with _pool.acquire() as conn:
         rows = await conn.fetch(
@@ -351,3 +386,69 @@ async def get_stats() -> dict:
             "leads_week": leads_week,
             "leads_by_source": {r["source"]: r["cnt"] for r in leads_by_source},
         }
+
+
+# ---------- BOOKINGS (календарь занятости, вводится вручную через админку) ----------
+
+async def add_booking(property_id: str, check_in, check_out, note: str = None) -> dict:
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO bookings (property_id, check_in, check_out, note)
+            VALUES ($1, $2, $3, $4)
+            RETURNING *
+            """,
+            property_id, check_in, check_out, note,
+        )
+        return dict(row)
+
+
+async def get_bookings_for_property(property_id: str, upcoming_only: bool = True) -> list[dict]:
+    async with _pool.acquire() as conn:
+        if upcoming_only:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM bookings
+                WHERE property_id = $1 AND check_out >= CURRENT_DATE
+                ORDER BY check_in
+                """,
+                property_id,
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT * FROM bookings WHERE property_id = $1 ORDER BY check_in",
+                property_id,
+            )
+        return [dict(r) for r in rows]
+
+
+async def get_overlapping_bookings(property_id: str, check_in, check_out) -> list[dict]:
+    """Брони, пересекающиеся с указанным диапазоном [check_in, check_out)."""
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT * FROM bookings
+            WHERE property_id = $1
+              AND check_in < $3
+              AND check_out > $2
+            ORDER BY check_in
+            """,
+            property_id, check_in, check_out,
+        )
+        return [dict(r) for r in rows]
+
+
+async def is_property_available(property_id: str, check_in, check_out) -> bool:
+    overlapping = await get_overlapping_bookings(property_id, check_in, check_out)
+    return len(overlapping) == 0
+
+
+async def get_booking_by_id(booking_id: int) -> dict | None:
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM bookings WHERE id = $1", booking_id)
+        return dict(row) if row else None
+
+
+async def delete_booking(booking_id: int):
+    async with _pool.acquire() as conn:
+        await conn.execute("DELETE FROM bookings WHERE id = $1", booking_id)
